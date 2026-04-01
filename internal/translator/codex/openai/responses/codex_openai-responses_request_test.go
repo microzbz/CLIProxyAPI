@@ -264,6 +264,34 @@ func TestConvertSystemRoleToDeveloper_AssistantRole(t *testing.T) {
 	}
 }
 
+func TestConvertOpenAIResponsesRequestToCodex_NormalizesFunctionToolSchema(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gpt-5.2",
+		"tools": [
+			{
+				"type": "function",
+				"name": "mcp__pencil__get_style_guide_tags",
+				"description": "Get style guide tags",
+				"parameters": {"type": "object"}
+			}
+		]
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.2", inputJSON, false)
+	outputStr := string(output)
+
+	params := gjson.Get(outputStr, "tools.0.parameters")
+	if !params.Exists() {
+		t.Fatalf("expected tools.0.parameters to exist: %s", outputStr)
+	}
+	if params.Get("type").String() != "object" {
+		t.Fatalf("expected parameters.type=object, got %q", params.Get("type").String())
+	}
+	if !params.Get("properties").Exists() {
+		t.Fatalf("expected parameters.properties to exist: %s", params.Raw)
+	}
+}
+
 func TestConvertOpenAIResponsesRequestToCodex_NormalizesWebSearchPreview(t *testing.T) {
 	inputJSON := []byte(`{
 		"model": "gpt-5.4-mini",

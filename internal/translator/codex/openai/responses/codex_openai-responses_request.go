@@ -2,6 +2,7 @@ package responses
 
 import (
 	"fmt"
+	"strings"
 
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
@@ -34,6 +35,7 @@ func ConvertOpenAIResponsesRequestToCodex(modelName string, inputRawJSON []byte,
 
 	rawJSON, _ = sjson.DeleteBytes(rawJSON, "truncation")
 	rawJSON = applyResponsesCompactionCompatibility(rawJSON)
+	rawJSON = normalizeCodexFunctionToolSchemas(rawJSON)
 
 	// Delete the user field as it is not supported by the Codex upstream.
 	rawJSON, _ = sjson.DeleteBytes(rawJSON, "user")
@@ -127,6 +129,46 @@ func normalizeCodexBuiltinToolAtPath(rawJSON []byte, path string) []byte {
 
 	log.Debugf("codex responses: normalized builtin tool type at %s from %q to %q", path, currentType, normalizedType)
 	return updated
+}
+
+func normalizeCodexFunctionToolSchemas(rawJSON []byte) []byte {
+	tools := gjson.GetBytes(rawJSON, "tools")
+	if !tools.IsArray() {
+		return rawJSON
+	}
+
+	result := rawJSON
+	arr := tools.Array()
+	for i := 0; i < len(arr); i++ {
+		tool := arr[i]
+		if tool.Get("type").String() != "function" {
+			continue
+		}
+		path := fmt.Sprintf("tools.%d.parameters", i)
+		params := tool.Get("parameters")
+		normalized := normalizeCodexToolParameters(params.Raw)
+		result, _ = sjson.SetRawBytes(result, path, []byte(normalized))
+	}
+	return result
+}
+
+func normalizeCodexToolParameters(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "null" || !gjson.Valid(raw) {
+		return `{"type":"object","properties":{}}`
+	}
+
+	result := gjson.Parse(raw)
+	schema := []byte(raw)
+	schemaType := strings.TrimSpace(result.Get("type").String())
+	if schemaType == "" {
+		schema, _ = sjson.SetBytes(schema, "type", "object")
+		schemaType = "object"
+	}
+	if schemaType == "object" && !result.Get("properties").Exists() {
+		schema, _ = sjson.SetRawBytes(schema, "properties", []byte(`{}`))
+	}
+	return string(schema)
 }
 
 // normalizeCodexBuiltinToolType centralizes the current known Codex Responses

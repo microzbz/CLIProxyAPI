@@ -313,7 +313,9 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 						item, _ = sjson.SetBytes(item, "description", v.Value())
 					}
 					if v := fn.Get("parameters"); v.Exists() {
-						item, _ = sjson.SetRawBytes(item, "parameters", []byte(v.Raw))
+						item, _ = sjson.SetRawBytes(item, "parameters", []byte(normalizeToolParameters(v.Raw)))
+					} else {
+						item, _ = sjson.SetRawBytes(item, "parameters", []byte(`{"type":"object","properties":{}}`))
 					}
 					if v := fn.Get("strict"); v.Exists() {
 						item, _ = sjson.SetBytes(item, "strict", v.Value())
@@ -357,6 +359,25 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 
 	out, _ = sjson.SetBytes(out, "store", false)
 	return out
+}
+
+func normalizeToolParameters(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || raw == "null" || !gjson.Valid(raw) {
+		return `{"type":"object","properties":{}}`
+	}
+
+	result := gjson.Parse(raw)
+	schema := []byte(raw)
+	schemaType := strings.TrimSpace(result.Get("type").String())
+	if schemaType == "" {
+		schema, _ = sjson.SetBytes(schema, "type", "object")
+		schemaType = "object"
+	}
+	if schemaType == "object" && !result.Get("properties").Exists() {
+		schema, _ = sjson.SetRawBytes(schema, "properties", []byte(`{}`))
+	}
+	return string(schema)
 }
 
 // shortenNameIfNeeded applies the simple shortening rule for a single name.

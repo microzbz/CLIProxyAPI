@@ -20,8 +20,9 @@ import (
 )
 
 const (
-	DefaultPanelGitHubRepository = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
-	DefaultPprofAddr             = "127.0.0.1:8316"
+	DefaultPanelGitHubRepository   = "https://github.com/router-for-me/Cli-Proxy-API-Management-Center"
+	DefaultPprofAddr               = "127.0.0.1:8316"
+	DefaultRequestLogRetentionDays = 15
 )
 
 // Config represents the application's configuration, loaded from a YAML file.
@@ -61,6 +62,10 @@ type Config struct {
 	// ErrorLogsMaxFiles limits the number of error log files retained when request logging is disabled.
 	// When exceeded, the oldest error log files are deleted. Default is 10. Set to 0 to disable cleanup.
 	ErrorLogsMaxFiles int `yaml:"error-logs-max-files" json:"error-logs-max-files"`
+
+	// RequestLogRetentionDays controls how long request log files are retained before cleanup.
+	// Default is 15 days.
+	RequestLogRetentionDays int `yaml:"request-log-retention-days" json:"request-log-retention-days"`
 
 	// UsageStatisticsEnabled toggles in-memory usage aggregation; when false, usage data is discarded.
 	UsageStatisticsEnabled bool `yaml:"usage-statistics-enabled" json:"usage-statistics-enabled"`
@@ -566,6 +571,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	cfg.LoggingToFile = false
 	cfg.LogsMaxTotalSizeMB = 0
 	cfg.ErrorLogsMaxFiles = 10
+	cfg.RequestLogRetentionDays = DefaultRequestLogRetentionDays
 	cfg.UsageStatisticsEnabled = false
 	cfg.DisableCooling = false
 	cfg.Pprof.Enable = false
@@ -626,6 +632,10 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	if cfg.ErrorLogsMaxFiles < 0 {
 		cfg.ErrorLogsMaxFiles = 10
+	}
+
+	if cfg.RequestLogRetentionDays <= 0 {
+		cfg.RequestLogRetentionDays = DefaultRequestLogRetentionDays
 	}
 
 	if cfg.MaxRetryCredentials < 0 {
@@ -1309,6 +1319,8 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 		switch fullPath {
 		case "error-logs-max-files":
 			return node.Value == "10"
+		case "request-log-retention-days":
+			return node.Value == "15"
 		}
 	}
 

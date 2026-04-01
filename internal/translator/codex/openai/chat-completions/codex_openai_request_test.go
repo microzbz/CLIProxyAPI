@@ -176,6 +176,74 @@ func TestToolCallWithContent(t *testing.T) {
 	}
 }
 
+func TestToolSchemaMissingPropertiesIsNormalized(t *testing.T) {
+	input := []byte(`{
+		"model": "gpt-4o",
+		"messages": [
+			{"role": "user", "content": "hello"}
+		],
+		"tools": [
+			{
+				"type": "function",
+				"function": {
+					"name": "mcp__pencil__get_style_guide_tags",
+					"description": "Get style guide tags",
+					"parameters": {"type": "object"}
+				}
+			}
+		]
+	}`)
+
+	out := ConvertOpenAIRequestToCodex("gpt-4o", input, false)
+	result := string(out)
+
+	params := gjson.Get(result, "tools.0.parameters")
+	if !params.Exists() {
+		t.Fatalf("expected tools.0.parameters to exist: %s", result)
+	}
+	if params.Get("type").String() != "object" {
+		t.Fatalf("expected parameters.type=object, got %q", params.Get("type").String())
+	}
+	if !params.Get("properties").Exists() {
+		t.Fatalf("expected parameters.properties to be injected: %s", params.Raw)
+	}
+	if !params.Get("properties").IsObject() {
+		t.Fatalf("expected parameters.properties to be an object: %s", params.Raw)
+	}
+}
+
+func TestToolSchemaMissingEntireParametersGetsDefaultObject(t *testing.T) {
+	input := []byte(`{
+		"model": "gpt-4o",
+		"messages": [
+			{"role": "user", "content": "hello"}
+		],
+		"tools": [
+			{
+				"type": "function",
+				"function": {
+					"name": "tool_without_schema",
+					"description": "No schema"
+				}
+			}
+		]
+	}`)
+
+	out := ConvertOpenAIRequestToCodex("gpt-4o", input, false)
+	result := string(out)
+
+	params := gjson.Get(result, "tools.0.parameters")
+	if !params.Exists() {
+		t.Fatalf("expected tools.0.parameters to exist: %s", result)
+	}
+	if params.Get("type").String() != "object" {
+		t.Fatalf("expected parameters.type=object, got %q", params.Get("type").String())
+	}
+	if !params.Get("properties").Exists() {
+		t.Fatalf("expected default parameters.properties: %s", params.Raw)
+	}
+}
+
 // Parallel tool calls: assistant invokes 3 tools at once, all call_ids
 // and outputs must be translated and paired correctly.
 func TestMultipleToolCalls(t *testing.T) {

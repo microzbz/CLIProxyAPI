@@ -1,0 +1,53 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: cli-proxy-postgres-local
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-cliproxy_local}
+      POSTGRES_USER: ${POSTGRES_USER:-cliproxy}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-huigeai!@#123}
+    ports:
+      - "${POSTGRES_HOST_PORT:-55432}:5432"
+    volumes:
+      - cli_proxy_pgstore_local_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cliproxy} -d ${POSTGRES_DB:-cliproxy_local}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  cli-proxy-api:
+    image: ${CLI_PROXY_IMAGE:-cliproxyapi-pgstore-local:20260331}
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VERSION: ${VERSION:-dev-pgstore-local}
+        COMMIT: ${COMMIT:-local}
+        BUILD_DATE: ${BUILD_DATE:-2026-03-31}
+    container_name: cli-proxy-api-pgstore-local
+    depends_on:
+      postgres:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      DEPLOY: ${DEPLOY:-}
+      MANAGEMENT_PASSWORD: ${MANAGEMENT_PASSWORD:-huigeai!@#123}
+      PGSTORE_DSN: host=postgres port=5432 user=${POSTGRES_USER:-cliproxy} password=${POSTGRES_PASSWORD:-huigeai!@#123} dbname=${POSTGRES_DB:-cliproxy_local} sslmode=disable
+      PGSTORE_SCHEMA: ${PGSTORE_SCHEMA:-public}
+      PGSTORE_LOCAL_PATH: ${PGSTORE_LOCAL_PATH:-/CLIProxyAPI/runtime}
+    ports:
+      - "${CLI_PROXY_HOST_PORT:-18327}:8317"
+    volumes:
+      - ${CLI_PROXY_CONFIG_PATH:-./config.yaml}:/CLIProxyAPI/config.yaml
+      - ${CLI_PROXY_CONFIG_PATH:-./config.yaml}:${PGSTORE_LOCAL_PATH:-/CLIProxyAPI/runtime}/pgstore/config/config.yaml
+      - cli_proxy_pgstore_local_data:${PGSTORE_LOCAL_PATH:-/CLIProxyAPI/runtime}
+      - ${CLI_PROXY_LOG_PATH:-./logs-pgstore-local}:/CLIProxyAPI/logs
+      - ${CLI_PROXY_LOG_PATH:-./logs-pgstore-local}:${PGSTORE_LOCAL_PATH:-/CLIProxyAPI/runtime}/pgstore/config/logs
+    restart: unless-stopped
+
+volumes:
+  cli_proxy_pgstore_local_db:
+  cli_proxy_pgstore_local_data:

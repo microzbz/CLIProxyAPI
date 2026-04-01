@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"compress/flate"
 	"compress/gzip"
+	"context"
 	"fmt"
 	"io"
 	"os"
@@ -20,13 +21,22 @@ import (
 	"github.com/andybalholm/brotli"
 	"github.com/klauspost/compress/zstd"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/buildinfo"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 )
 
 var requestLogID atomic.Uint64
+
+var encryptedContentLogPattern = regexp.MustCompile(`("encrypted_content"\s*:\s*")([^"]*)(")`)
+
+const (
+	requestLogAsyncQueueSize       = 16
+	inlineImageAsyncThresholdBytes = 256 << 10
+)
 
 // RequestLogger defines the interface for logging HTTP requests and responses.
 // It provides methods for logging both regular and streaming HTTP request/response cycles.
@@ -135,6 +145,31 @@ type FileRequestLogger struct {
 
 	// errorLogsMaxFiles limits the number of error log files retained.
 	errorLogsMaxFiles int
+
+	// requestLogRetentionDays controls how long request log files are retained.
+	requestLogRetentionDays int
+
+	// asyncJobs serializes large inline-image log writes so requests are not blocked by disk I/O spikes.
+	asyncJobs chan requestLogJob
+
+	retentionCleanerCancel context.CancelFunc
+}
+
+type requestLogJob struct {
+	url                  string
+	method               string
+	requestHeaders       map[string][]string
+	body                 []byte
+	statusCode           int
+	responseHeaders      map[string][]string
+	response             []byte
+	apiRequest           []byte
+	apiResponse          []byte
+	apiResponseErrors    []*interfaces.ErrorMessage
+	force                bool
+	requestID            string
+	requestTimestamp     time.Time
+	apiResponseTimestamp time.Time
 }
 
 // NewFileRequestLogger creates a new file-based request logger.
@@ -148,7 +183,7 @@ type FileRequestLogger struct {
 //
 // Returns:
 //   - *FileRequestLogger: A new file-based request logger instance
-func NewFileRequestLogger(enabled bool, logsDir string, configDir string, errorLogsMaxFiles int) *FileRequestLogger {
+func NewFileRequestLogger(enabled bool, logsDir string, configDir string, errorLogsMaxFiles int, requestLogRetentionDays int) *FileRequestLogger {
 	// Resolve logsDir relative to the configuration file directory when it's not absolute.
 	if !filepath.IsAbs(logsDir) {
 		// If configDir is provided, resolve logsDir relative to it.
@@ -156,11 +191,16 @@ func NewFileRequestLogger(enabled bool, logsDir string, configDir string, errorL
 			logsDir = filepath.Join(configDir, logsDir)
 		}
 	}
-	return &FileRequestLogger{
-		enabled:           enabled,
-		logsDir:           logsDir,
-		errorLogsMaxFiles: errorLogsMaxFiles,
+	logger := &FileRequestLogger{
+		enabled:                 enabled,
+		logsDir:                 logsDir,
+		errorLogsMaxFiles:       errorLogsMaxFiles,
+		requestLogRetentionDays: normalizeRequestLogRetentionDays(requestLogRetentionDays),
+		asyncJobs:               make(chan requestLogJob, requestLogAsyncQueueSize),
 	}
+	go logger.asyncWorker()
+	logger.configureRetentionCleaner()
+	return logger
 }
 
 // IsEnabled returns whether request logging is currently enabled.
@@ -183,6 +223,12 @@ func (l *FileRequestLogger) SetEnabled(enabled bool) {
 // SetErrorLogsMaxFiles updates the maximum number of error log files to retain.
 func (l *FileRequestLogger) SetErrorLogsMaxFiles(maxFiles int) {
 	l.errorLogsMaxFiles = maxFiles
+}
+
+// SetRequestLogRetentionDays updates the request log retention period in days.
+func (l *FileRequestLogger) SetRequestLogRetentionDays(days int) {
+	l.requestLogRetentionDays = normalizeRequestLogRetentionDays(days)
+	l.configureRetentionCleaner()
 }
 
 // LogRequest logs a complete non-streaming request/response cycle to a file.
@@ -218,19 +264,49 @@ func (l *FileRequestLogger) logRequest(url, method string, requestHeaders map[st
 		return nil
 	}
 
+	job := requestLogJob{
+		url:                  url,
+		method:               method,
+		requestHeaders:       cloneHeaderMap(requestHeaders),
+		body:                 body,
+		statusCode:           statusCode,
+		responseHeaders:      cloneHeaderMap(responseHeaders),
+		response:             response,
+		apiRequest:           apiRequest,
+		apiResponse:          apiResponse,
+		apiResponseErrors:    cloneErrorMessages(apiResponseErrors),
+		force:                force,
+		requestID:            requestID,
+		requestTimestamp:     requestTimestamp,
+		apiResponseTimestamp: apiResponseTimestamp,
+	}
+
+	if shouldAsyncFlushRequestLog(body, apiRequest, apiResponse, response) {
+		select {
+		case l.asyncJobs <- job:
+			return nil
+		default:
+			log.Warn("request logging async queue full, falling back to synchronous log write")
+		}
+	}
+
+	return l.writeRequestJob(job)
+}
+
+func (l *FileRequestLogger) writeRequestJob(job requestLogJob) error {
 	// Ensure logs directory exists
 	if errEnsure := l.ensureLogsDir(); errEnsure != nil {
 		return fmt.Errorf("failed to create logs directory: %w", errEnsure)
 	}
 
 	// Generate filename with request ID
-	filename := l.generateFilename(url, requestID)
-	if force && !l.enabled {
-		filename = l.generateErrorFilename(url, requestID)
+	filename := l.generateFilename(job.url, job.requestID)
+	if job.force && !l.enabled {
+		filename = l.generateErrorFilename(job.url, job.requestID)
 	}
 	filePath := filepath.Join(l.logsDir, filename)
 
-	requestBodyPath, errTemp := l.writeRequestBodyTempFile(body)
+	requestBodyPath, errTemp := l.writeRequestBodyTempFile(job.body)
 	if errTemp != nil {
 		log.WithError(errTemp).Warn("failed to create request body temp file, falling back to direct write")
 	}
@@ -242,10 +318,10 @@ func (l *FileRequestLogger) logRequest(url, method string, requestHeaders map[st
 		}()
 	}
 
-	responseToWrite, decompressErr := l.decompressResponse(responseHeaders, response)
+	responseToWrite, decompressErr := l.decompressResponse(job.responseHeaders, job.response)
 	if decompressErr != nil {
 		// If decompression fails, continue with original response and annotate the log output.
-		responseToWrite = response
+		responseToWrite = job.response
 	}
 
 	logFile, errOpen := os.OpenFile(filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
@@ -255,20 +331,20 @@ func (l *FileRequestLogger) logRequest(url, method string, requestHeaders map[st
 
 	writeErr := l.writeNonStreamingLog(
 		logFile,
-		url,
-		method,
-		requestHeaders,
-		body,
+		job.url,
+		job.method,
+		job.requestHeaders,
+		job.body,
 		requestBodyPath,
-		apiRequest,
-		apiResponse,
-		apiResponseErrors,
-		statusCode,
-		responseHeaders,
+		job.apiRequest,
+		job.apiResponse,
+		job.apiResponseErrors,
+		job.statusCode,
+		job.responseHeaders,
 		responseToWrite,
 		decompressErr,
-		requestTimestamp,
-		apiResponseTimestamp,
+		job.requestTimestamp,
+		job.apiResponseTimestamp,
 	)
 	if errClose := logFile.Close(); errClose != nil {
 		log.WithError(errClose).Warn("failed to close request log file")
@@ -280,7 +356,7 @@ func (l *FileRequestLogger) logRequest(url, method string, requestHeaders map[st
 		return fmt.Errorf("failed to write log file: %w", writeErr)
 	}
 
-	if force && !l.enabled {
+	if job.force && !l.enabled {
 		if errCleanup := l.cleanupOldErrorLogs(); errCleanup != nil {
 			log.WithError(errCleanup).Warn("failed to clean up old error logs")
 		}
@@ -322,9 +398,27 @@ func (l *FileRequestLogger) LogStreamingRequest(url, method string, headers map[
 		requestHeaders[key] = headerValues
 	}
 
-	requestBodyPath, errTemp := l.writeRequestBodyTempFile(body)
-	if errTemp != nil {
-		return nil, fmt.Errorf("failed to create request body temp file: %w", errTemp)
+	requestBodyPath := ""
+	requestBodyDone := make(chan struct{})
+	requestBodyErr := make(chan error, 1)
+	if shouldAsyncFlushPayload(body) {
+		requestBodyFile, errCreate := os.CreateTemp(l.logsDir, "request-body-*.tmp")
+		if errCreate != nil {
+			return nil, fmt.Errorf("failed to create request body temp file: %w", errCreate)
+		}
+		requestBodyPath = requestBodyFile.Name()
+		if errClose := requestBodyFile.Close(); errClose != nil {
+			_ = os.Remove(requestBodyPath)
+			return nil, fmt.Errorf("failed to close request body temp file: %w", errClose)
+		}
+		go writeBytesToPathAsync(requestBodyPath, body, requestBodyDone, requestBodyErr)
+	} else {
+		close(requestBodyDone)
+		requestBodyPathSync, errTemp := l.writeRequestBodyTempFile(body)
+		if errTemp != nil {
+			return nil, fmt.Errorf("failed to create request body temp file: %w", errTemp)
+		}
+		requestBodyPath = requestBodyPathSync
 	}
 
 	responseBodyFile, errCreate := os.CreateTemp(l.logsDir, "response-body-*.tmp")
@@ -342,6 +436,8 @@ func (l *FileRequestLogger) LogStreamingRequest(url, method string, headers map[
 		timestamp:        time.Now(),
 		requestHeaders:   requestHeaders,
 		requestBodyPath:  requestBodyPath,
+		requestBodyDone:  requestBodyDone,
+		requestBodyErr:   requestBodyErr,
 		responseBodyPath: responseBodyPath,
 		responseBodyFile: responseBodyFile,
 		chunkChan:        make(chan []byte, 100), // Buffered channel for async writes
@@ -493,6 +589,115 @@ func (l *FileRequestLogger) cleanupOldErrorLogs() error {
 	return nil
 }
 
+func (l *FileRequestLogger) configureRetentionCleaner() {
+	if l == nil {
+		return
+	}
+	if l.retentionCleanerCancel != nil {
+		l.retentionCleanerCancel()
+		l.retentionCleanerCancel = nil
+	}
+
+	days := normalizeRequestLogRetentionDays(l.requestLogRetentionDays)
+	if days <= 0 {
+		return
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	l.retentionCleanerCancel = cancel
+	go l.runRetentionCleaner(ctx, days)
+}
+
+func (l *FileRequestLogger) runRetentionCleaner(ctx context.Context, retentionDays int) {
+	ticker := time.NewTicker(time.Hour)
+	defer ticker.Stop()
+
+	cleanOnce := func() {
+		removed, err := l.cleanupExpiredRequestLogs(retentionDays)
+		if err != nil {
+			log.WithError(err).Warn("failed to cleanup expired request logs")
+			return
+		}
+		if removed > 0 {
+			log.Debugf("request logging: removed %d expired request log(s)", removed)
+		}
+	}
+
+	cleanOnce()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			cleanOnce()
+		}
+	}
+}
+
+func (l *FileRequestLogger) cleanupExpiredRequestLogs(retentionDays int) (int, error) {
+	if l == nil {
+		return 0, nil
+	}
+	days := normalizeRequestLogRetentionDays(retentionDays)
+	if days <= 0 {
+		return 0, nil
+	}
+
+	entries, errRead := os.ReadDir(l.logsDir)
+	if errRead != nil {
+		if os.IsNotExist(errRead) {
+			return 0, nil
+		}
+		return 0, errRead
+	}
+
+	cutoff := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
+	removed := 0
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !isRequestLogFileName(name) {
+			continue
+		}
+		info, errInfo := entry.Info()
+		if errInfo != nil {
+			log.WithError(errInfo).Warn("failed to read request log info")
+			continue
+		}
+		if info.ModTime().After(cutoff) {
+			continue
+		}
+		if errRemove := os.Remove(filepath.Join(l.logsDir, name)); errRemove != nil {
+			log.WithError(errRemove).Warnf("failed to remove expired request log: %s", name)
+			continue
+		}
+		removed++
+	}
+
+	return removed, nil
+}
+
+func isRequestLogFileName(name string) bool {
+	trimmed := strings.TrimSpace(name)
+	if trimmed == "" || !strings.HasSuffix(strings.ToLower(trimmed), ".log") {
+		return false
+	}
+	lower := strings.ToLower(trimmed)
+	if lower == "main.log" || strings.HasPrefix(lower, "main-") || strings.HasPrefix(lower, "main.") {
+		return false
+	}
+	return true
+}
+
+func normalizeRequestLogRetentionDays(days int) int {
+	if days <= 0 {
+		return config.DefaultRequestLogRetentionDays
+	}
+	return days
+}
+
 func (l *FileRequestLogger) writeRequestBodyTempFile(body []byte) (string, error) {
 	tmpFile, errCreate := os.CreateTemp(l.logsDir, "request-body-*.tmp")
 	if errCreate != nil {
@@ -510,6 +715,61 @@ func (l *FileRequestLogger) writeRequestBodyTempFile(body []byte) (string, error
 		return "", errClose
 	}
 	return tmpPath, nil
+}
+
+func (l *FileRequestLogger) asyncWorker() {
+	for job := range l.asyncJobs {
+		if err := l.writeRequestJob(job); err != nil {
+			log.WithError(err).Warn("failed to asynchronously write request log")
+		}
+	}
+}
+
+func shouldAsyncFlushRequestLog(body, apiRequest, apiResponse, response []byte) bool {
+	return shouldAsyncFlushPayload(body) ||
+		shouldAsyncFlushPayload(apiRequest) ||
+		shouldAsyncFlushPayload(apiResponse) ||
+		shouldAsyncFlushPayload(response)
+}
+
+func shouldAsyncFlushPayload(payload []byte) bool {
+	if len(payload) < inlineImageAsyncThresholdBytes {
+		return false
+	}
+	return bytes.Contains(payload, []byte("data:image/")) && bytes.Contains(payload, []byte(";base64,")) ||
+		bytes.Contains(payload, []byte(`"type":"base64"`)) && bytes.Contains(payload, []byte(`"media_type":"image/`))
+}
+
+func writeBytesToPathAsync(path string, data []byte, done chan struct{}, errCh chan error) {
+	defer close(done)
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		select {
+		case errCh <- err:
+		default:
+		}
+	}
+}
+
+func cloneHeaderMap(in map[string][]string) map[string][]string {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string][]string, len(in))
+	for key, values := range in {
+		headerValues := make([]string, len(values))
+		copy(headerValues, values)
+		out[key] = headerValues
+	}
+	return out
+}
+
+func cloneErrorMessages(in []*interfaces.ErrorMessage) []*interfaces.ErrorMessage {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]*interfaces.ErrorMessage, len(in))
+	copy(out, in)
+	return out
 }
 
 func (l *FileRequestLogger) writeNonStreamingLog(
@@ -543,7 +803,7 @@ func (l *FileRequestLogger) writeNonStreamingLog(
 	if errWrite := writeAPISection(w, "=== API RESPONSE ===\n", "=== API RESPONSE", apiResponse, apiResponseTimestamp); errWrite != nil {
 		return errWrite
 	}
-	return writeResponseSection(w, statusCode, true, responseHeaders, bytes.NewReader(response), decompressErr, true)
+	return writeResponseSection(w, statusCode, true, responseHeaders, bytes.NewReader(sanitizeLogJSONPayload(response)), decompressErr, true)
 }
 
 func writeRequestInfoWithBody(
@@ -604,7 +864,7 @@ func writeRequestInfoWithBody(
 		if errClose := bodyFile.Close(); errClose != nil {
 			log.WithError(errClose).Warn("failed to close request body temp file")
 		}
-	} else if _, errWrite := w.Write(body); errWrite != nil {
+	} else if _, errWrite := w.Write(sanitizeLogJSONPayload(body)); errWrite != nil {
 		return errWrite
 	}
 
@@ -618,6 +878,7 @@ func writeAPISection(w io.Writer, sectionHeader string, sectionPrefix string, pa
 	if len(payload) == 0 {
 		return nil
 	}
+	payload = sanitizeLogAPIPayload(payload)
 
 	if bytes.HasPrefix(payload, []byte(sectionPrefix)) {
 		if _, errWrite := w.Write(payload); errWrite != nil {
@@ -698,7 +959,11 @@ func writeResponseSection(w io.Writer, statusCode int, statusWritten bool, respo
 		return errWrite
 	}
 
-	if responseReader != nil {
+	if shouldOmitEventStreamLogBody(responseHeaders) {
+		if _, errWrite := io.WriteString(w, "[event-stream body omitted from log]"); errWrite != nil {
+			return errWrite
+		}
+	} else if responseReader != nil {
 		if _, errCopy := io.Copy(w, responseReader); errCopy != nil {
 			return errCopy
 		}
@@ -953,10 +1218,74 @@ func (l *FileRequestLogger) formatRequestInfo(url, method string, headers map[st
 	content.WriteString("\n")
 
 	content.WriteString("=== REQUEST BODY ===\n")
-	content.Write(body)
+	content.Write(sanitizeLogJSONPayload(body))
 	content.WriteString("\n\n")
 
 	return content.String()
+}
+
+func sanitizeLogAPIPayload(payload []byte) []byte {
+	if len(payload) == 0 {
+		return nil
+	}
+
+	clean := sanitizeLogJSONPayload(payload)
+	bodyMarker := []byte("\nBody:\n")
+	parts := bytes.SplitN(clean, bodyMarker, 2)
+	if len(parts) != 2 || !looksLikeSSEPayload(parts[1]) {
+		return clean
+	}
+
+	result := make([]byte, 0, len(parts[0])+len(bodyMarker)+64)
+	result = append(result, parts[0]...)
+	result = append(result, bodyMarker...)
+	result = append(result, []byte("[event-stream body omitted from log]\n")...)
+	return result
+}
+
+func sanitizeLogJSONPayload(payload []byte) []byte {
+	if len(payload) == 0 {
+		return nil
+	}
+	if !bytes.Contains(payload, []byte(`"encrypted_content"`)) {
+		return payload
+	}
+	return encryptedContentLogPattern.ReplaceAll(payload, []byte(`${1}[REDACTED]${3}`))
+}
+
+func looksLikeSSEPayload(payload []byte) bool {
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) == 0 {
+		return false
+	}
+	if bytes.HasPrefix(trimmed, []byte("event:")) || bytes.HasPrefix(trimmed, []byte("data:")) {
+		return true
+	}
+	if bytes.Contains(trimmed, []byte("\nevent:")) || bytes.Contains(trimmed, []byte("\ndata:")) {
+		return true
+	}
+	if gjson.ValidBytes(trimmed) {
+		eventType := gjson.GetBytes(trimmed, "type").String()
+		return strings.HasPrefix(eventType, "response.")
+	}
+	return false
+}
+
+func shouldOmitEventStreamLogBody(headers map[string][]string) bool {
+	if len(headers) == 0 {
+		return false
+	}
+	for key, values := range headers {
+		if !strings.EqualFold(key, "Content-Type") {
+			continue
+		}
+		for _, value := range values {
+			if strings.Contains(strings.ToLower(value), "text/event-stream") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // FileStreamingLogWriter implements StreamingLogWriter for file-based streaming logs.
@@ -980,6 +1309,12 @@ type FileStreamingLogWriter struct {
 
 	// requestBodyPath is a temporary file path holding the request body.
 	requestBodyPath string
+
+	// requestBodyDone signals completion of asynchronous request body spooling.
+	requestBodyDone chan struct{}
+
+	// requestBodyErr captures asynchronous request body spool failures.
+	requestBodyErr chan error
 
 	// responseBodyPath is a temporary file path holding the streaming response body.
 	responseBodyPath string
@@ -1107,6 +1442,16 @@ func (w *FileStreamingLogWriter) SetFirstChunkTimestamp(timestamp time.Time) {
 func (w *FileStreamingLogWriter) Close() error {
 	if w.chunkChan != nil {
 		close(w.chunkChan)
+	}
+
+	if w.requestBodyDone != nil {
+		<-w.requestBodyDone
+	}
+	select {
+	case errWrite := <-w.requestBodyErr:
+		w.cleanupTempFiles()
+		return errWrite
+	default:
 	}
 
 	// Wait for async writer to finish spooling chunks

@@ -60,7 +60,7 @@ type ServerOption func(*serverOptionConfig)
 func defaultRequestLoggerFactory(cfg *config.Config, configPath string) logging.RequestLogger {
 	configDir := filepath.Dir(configPath)
 	logsDir := logging.ResolveLogDirectory(cfg)
-	return logging.NewFileRequestLogger(cfg.RequestLog, logsDir, configDir, cfg.ErrorLogsMaxFiles)
+	return logging.NewFileRequestLogger(cfg.RequestLog, logsDir, configDir, cfg.ErrorLogsMaxFiles, cfg.RequestLogRetentionDays)
 }
 
 // WithMiddleware appends additional Gin middleware during server construction.
@@ -510,6 +510,10 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PUT("/error-logs-max-files", s.mgmt.PutErrorLogsMaxFiles)
 		mgmt.PATCH("/error-logs-max-files", s.mgmt.PutErrorLogsMaxFiles)
 
+		mgmt.GET("/request-log-retention-days", s.mgmt.GetRequestLogRetentionDays)
+		mgmt.PUT("/request-log-retention-days", s.mgmt.PutRequestLogRetentionDays)
+		mgmt.PATCH("/request-log-retention-days", s.mgmt.PutRequestLogRetentionDays)
+
 		mgmt.GET("/usage-statistics-enabled", s.mgmt.GetUsageStatisticsEnabled)
 		mgmt.PUT("/usage-statistics-enabled", s.mgmt.PutUsageStatisticsEnabled)
 		mgmt.PATCH("/usage-statistics-enabled", s.mgmt.PutUsageStatisticsEnabled)
@@ -907,6 +911,12 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 	if s.requestLogger != nil && (oldCfg == nil || oldCfg.ErrorLogsMaxFiles != cfg.ErrorLogsMaxFiles) {
 		if setter, ok := s.requestLogger.(interface{ SetErrorLogsMaxFiles(int) }); ok {
 			setter.SetErrorLogsMaxFiles(cfg.ErrorLogsMaxFiles)
+		}
+	}
+
+	if s.requestLogger != nil && (oldCfg == nil || oldCfg.RequestLogRetentionDays != cfg.RequestLogRetentionDays) {
+		if setter, ok := s.requestLogger.(interface{ SetRequestLogRetentionDays(int) }); ok {
+			setter.SetRequestLogRetentionDays(cfg.RequestLogRetentionDays)
 		}
 	}
 

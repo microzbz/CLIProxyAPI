@@ -1,0 +1,54 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: cli-proxy-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-cliproxy}
+      POSTGRES_USER: ${POSTGRES_USER:-cliproxy}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-huigeai!@#123}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-cliproxy} -d ${POSTGRES_DB:-cliproxy}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  cli-proxy-api:
+    image: ${CLI_PROXY_IMAGE:-eceasy/cli-proxy-api:latest}
+    pull_policy: always
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VERSION: ${VERSION:-dev}
+        COMMIT: ${COMMIT:-none}
+        BUILD_DATE: ${BUILD_DATE:-unknown}
+    container_name: cli-proxy-api-pgsql
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DEPLOY: ${DEPLOY:-}
+      MANAGEMENT_PASSWORD: ${MANAGEMENT_PASSWORD:-huigeai!@#123}
+      PGSTORE_DSN: host=postgres port=5432 user=${POSTGRES_USER:-cliproxy} password=${POSTGRES_PASSWORD:-huigeai!@#123} dbname=${POSTGRES_DB:-cliproxy} sslmode=disable
+      PGSTORE_SCHEMA: ${PGSTORE_SCHEMA:-public}
+      PGSTORE_LOCAL_PATH: ${PGSTORE_LOCAL_PATH:-/data}
+    ports:
+      - "8317:8317"
+      - "8085:8085"
+      - "1455:1455"
+      - "54545:54545"
+      - "51121:51121"
+      - "11451:11451"
+    volumes:
+      - cli_proxy_data:${PGSTORE_LOCAL_PATH:-/data}
+      - ${CLI_PROXY_LOG_PATH:-./logs}:/CLIProxyAPI/logs
+    restart: unless-stopped
+
+volumes:
+  pg_data:
+  cli_proxy_data:

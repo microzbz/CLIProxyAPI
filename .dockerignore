@@ -22,6 +22,7 @@ conv/*
 config.yaml
 
 # Development/editor
+.tooling/*
 bin/*
 .vscode/*
 .claude/*
@@ -35,3 +36,8 @@ bin/*
 .bmad/*
 _bmad/*
 _bmad-output/*
+
+# Local configs and extra runtime outputs
+config.local.yaml
+logs-pgstore-local/*
+release/*

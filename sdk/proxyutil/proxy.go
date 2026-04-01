@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
 	"golang.org/x/net/proxy"
 )
@@ -82,6 +83,18 @@ func NewDirectTransport() *http.Transport {
 	return clone
 }
 
+func tuneTransportForProxy(transport *http.Transport) *http.Transport {
+	if transport == nil {
+		return nil
+	}
+	// Proxy tunnels to ChatGPT/Codex can be slow to establish on unstable links.
+	// Keep protocol defaults, but give the TLS handshake more headroom.
+	if transport.TLSHandshakeTimeout < 30*time.Second {
+		transport.TLSHandshakeTimeout = 30 * time.Second
+	}
+	return transport
+}
+
 // BuildHTTPTransport constructs an HTTP transport for the provided proxy setting.
 func BuildHTTPTransport(raw string) (*http.Transport, Mode, error) {
 	setting, errParse := Parse(raw)
@@ -111,11 +124,11 @@ func BuildHTTPTransport(raw string) (*http.Transport, Mode, error) {
 			transport.DialContext = func(_ context.Context, network, addr string) (net.Conn, error) {
 				return dialer.Dial(network, addr)
 			}
-			return transport, setting.Mode, nil
+			return tuneTransportForProxy(transport), setting.Mode, nil
 		}
 		transport := cloneDefaultTransport()
 		transport.Proxy = http.ProxyURL(setting.URL)
-		return transport, setting.Mode, nil
+		return tuneTransportForProxy(transport), setting.Mode, nil
 	default:
 		return nil, setting.Mode, nil
 	}
