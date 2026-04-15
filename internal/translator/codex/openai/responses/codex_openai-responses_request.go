@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -36,6 +37,9 @@ func ConvertOpenAIResponsesRequestToCodex(modelName string, inputRawJSON []byte,
 	rawJSON, _ = sjson.DeleteBytes(rawJSON, "truncation")
 	rawJSON = applyResponsesCompactionCompatibility(rawJSON)
 	rawJSON = normalizeCodexFunctionToolSchemas(rawJSON)
+	if effort := gjson.GetBytes(rawJSON, "reasoning.effort"); effort.Exists() {
+		rawJSON, _ = sjson.SetBytes(rawJSON, "reasoning.effort", thinking.NormalizeOpenAIEffort(effort.String()))
+	}
 
 	// Delete the user field as it is not supported by the Codex upstream.
 	rawJSON, _ = sjson.DeleteBytes(rawJSON, "user")

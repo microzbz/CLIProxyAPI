@@ -485,7 +485,7 @@ func extractOpenAIConfig(body []byte) ThinkingConfig {
 func extractCodexConfig(body []byte) ThinkingConfig {
 	// Check reasoning.effort (Codex / OpenAI Responses API format)
 	if effort := gjson.GetBytes(body, "reasoning.effort"); effort.Exists() {
-		value := effort.String()
+		value := NormalizeOpenAIEffort(effort.String())
 		if value == "none" {
 			return ThinkingConfig{Mode: ModeNone, Budget: 0}
 		}

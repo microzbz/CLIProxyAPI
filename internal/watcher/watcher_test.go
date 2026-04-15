@@ -1484,13 +1484,25 @@ func TestNormalizeAuthNil(t *testing.T) {
 // stubStore implements coreauth.Store plus watcher-specific persistence helpers.
 type stubStore struct {
 	authDir         string
+	authoritative   bool
+	listCalls       int32
+	listAuths       []*coreauth.Auth
 	cfgPersisted    int32
 	authPersisted   int32
 	lastAuthMessage string
 	lastAuthPaths   []string
 }
 
-func (s *stubStore) List(context.Context) ([]*coreauth.Auth, error) { return nil, nil }
+func (s *stubStore) List(context.Context) ([]*coreauth.Auth, error) {
+	atomic.AddInt32(&s.listCalls, 1)
+	out := make([]*coreauth.Auth, 0, len(s.listAuths))
+	for _, auth := range s.listAuths {
+		if auth != nil {
+			out = append(out, auth.Clone())
+		}
+	}
+	return out, nil
+}
 func (s *stubStore) Save(context.Context, *coreauth.Auth) (string, error) {
 	return "", nil
 }
@@ -1506,10 +1518,13 @@ func (s *stubStore) PersistAuthFiles(_ context.Context, message string, paths ..
 	return nil
 }
 func (s *stubStore) AuthDir() string { return s.authDir }
+func (s *stubStore) UseStoreAuthSource() bool {
+	return s.authoritative
+}
 
 func TestNewWatcherDetectsPersisterAndAuthDir(t *testing.T) {
 	tmp := t.TempDir()
-	store := &stubStore{authDir: tmp}
+	store := &stubStore{authDir: tmp, authoritative: true}
 	orig := sdkAuth.GetTokenStore()
 	sdkAuth.RegisterTokenStore(store)
 	defer sdkAuth.RegisterTokenStore(orig)
@@ -1521,8 +1536,159 @@ func TestNewWatcherDetectsPersisterAndAuthDir(t *testing.T) {
 	if w.storePersister == nil {
 		t.Fatal("expected storePersister to be set from token store")
 	}
+	if w.authStoreSource == nil {
+		t.Fatal("expected authStoreSource to be set from token store")
+	}
 	if w.mirroredAuthDir != tmp {
 		t.Fatalf("expected mirroredAuthDir %s, got %s", tmp, w.mirroredAuthDir)
+	}
+}
+
+func TestSnapshotCoreAuthsUsesAuthoritativeStoreForAuthFiles(t *testing.T) {
+	authDir := t.TempDir()
+	authFile := filepath.Join(authDir, "disk.json")
+	if err := os.WriteFile(authFile, []byte(`{"type":"codex","email":"disk@example.com"}`), 0o644); err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+
+	store := &stubStore{
+		authoritative: true,
+		listAuths: []*coreauth.Auth{
+			{ID: "pg-auth", Provider: "codex", Label: "pg"},
+		},
+	}
+	w := &Watcher{
+		authDir:         authDir,
+		authStoreSource: store,
+	}
+	w.SetConfig(&config.Config{
+		AuthDir:  authDir,
+		CodexKey: []config.CodexKey{{APIKey: "cfg-key"}},
+	})
+
+	auths := w.SnapshotCoreAuths()
+
+	var sawPG bool
+	var sawConfig bool
+	var sawDisk bool
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		if auth.ID == "pg-auth" {
+			sawPG = true
+		}
+		if auth.Attributes["api_key"] == "cfg-key" {
+			sawConfig = true
+		}
+		if auth.Attributes["email"] == "disk@example.com" {
+			sawDisk = true
+		}
+	}
+	if !sawPG {
+		t.Fatal("expected watcher snapshot to include auths loaded from store")
+	}
+	if !sawConfig {
+		t.Fatal("expected watcher snapshot to retain config-synthesized API key auths")
+	}
+	if sawDisk {
+		t.Fatal("expected watcher snapshot to ignore auth-directory synthesis when authoritative store is enabled")
+	}
+	if got := atomic.LoadInt32(&store.listCalls); got != 1 {
+		t.Fatalf("expected store.List to be called once, got %d", got)
+	}
+}
+
+func TestAddOrUpdateClientUsesAuthoritativeStoreSnapshot(t *testing.T) {
+	tmpDir := t.TempDir()
+	authFile := filepath.Join(tmpDir, "sample.json")
+	if err := os.WriteFile(authFile, []byte(`{"type":"codex","email":"disk@example.com"}`), 0o644); err != nil {
+		t.Fatalf("failed to write auth file: %v", err)
+	}
+
+	store := &stubStore{
+		authoritative: true,
+		listAuths: []*coreauth.Auth{
+			{ID: "pg-auth", Provider: "codex", Label: "from-store"},
+		},
+	}
+	w := &Watcher{
+		authDir:          tmpDir,
+		lastAuthHashes:   make(map[string]string),
+		lastAuthContents: make(map[string]*coreauth.Auth),
+		fileAuthsByPath:  make(map[string]map[string]*coreauth.Auth),
+		authStoreSource:  store,
+		storePersister:   store,
+	}
+	w.SetConfig(&config.Config{AuthDir: tmpDir})
+	queue := make(chan AuthUpdate, 8)
+	w.SetAuthUpdateQueue(queue)
+	defer w.stopDispatch()
+
+	w.addOrUpdateClient(authFile)
+
+	select {
+	case update := <-queue:
+		if update.Action != AuthUpdateActionAdd || update.ID != "pg-auth" {
+			t.Fatalf("unexpected auth update: %+v", update)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for authoritative store auth update")
+	}
+
+	if got := atomic.LoadInt32(&store.authPersisted); got != 1 {
+		t.Fatalf("expected PersistAuthFiles to be called once, got %d", got)
+	}
+	if got := atomic.LoadInt32(&store.listCalls); got != 1 {
+		t.Fatalf("expected store.List to be called once, got %d", got)
+	}
+	if len(w.currentAuths) != 1 || w.currentAuths["pg-auth"] == nil {
+		t.Fatalf("expected currentAuths to be rebuilt from store, got %#v", w.currentAuths)
+	}
+}
+
+func TestRemoveClientUsesAuthoritativeStoreSnapshot(t *testing.T) {
+	tmpDir := t.TempDir()
+	authFile := filepath.Join(tmpDir, "sample.json")
+	store := &stubStore{authoritative: true}
+	w := &Watcher{
+		authDir: tmpDir,
+		currentAuths: map[string]*coreauth.Auth{
+			"pg-auth": {ID: "pg-auth", Provider: "codex"},
+		},
+		authStoreSource: store,
+		storePersister:  store,
+	}
+	normalized := w.normalizeAuthPath(authFile)
+	w.lastAuthHashes = map[string]string{normalized: "hash"}
+	w.fileAuthsByPath = map[string]map[string]*coreauth.Auth{normalized: {"pg-auth": nil}}
+	w.SetConfig(&config.Config{AuthDir: tmpDir})
+	queue := make(chan AuthUpdate, 8)
+	w.SetAuthUpdateQueue(queue)
+	defer w.stopDispatch()
+
+	w.removeClient(authFile)
+
+	select {
+	case update := <-queue:
+		if update.Action != AuthUpdateActionDelete || update.ID != "pg-auth" {
+			t.Fatalf("unexpected auth update: %+v", update)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for authoritative store delete update")
+	}
+
+	if got := atomic.LoadInt32(&store.authPersisted); got != 1 {
+		t.Fatalf("expected PersistAuthFiles to be called once, got %d", got)
+	}
+	if got := atomic.LoadInt32(&store.listCalls); got != 1 {
+		t.Fatalf("expected store.List to be called once, got %d", got)
+	}
+	if len(w.currentAuths) != 0 {
+		t.Fatalf("expected currentAuths to be cleared from store snapshot, got %#v", w.currentAuths)
+	}
+	if _, ok := w.lastAuthHashes[normalized]; ok {
+		t.Fatal("expected removed auth file hash to be cleared")
 	}
 }
 

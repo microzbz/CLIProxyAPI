@@ -35,7 +35,7 @@ docker build \
 export CLI_PROXY_IMAGE="${IMAGE_NAME}"
 
 echo "Restarting pgstore local stack..."
-docker-compose -f "${COMPOSE_FILE}" up -d --force-recreate cli-proxy-api
+docker-compose -f "${COMPOSE_FILE}" up -d --no-deps --force-recreate cli-proxy-api
 
 echo "Done."
 echo "API: http://127.0.0.1:18327"

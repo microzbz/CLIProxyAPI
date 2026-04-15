@@ -22,6 +22,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
+	"github.com/tidwall/gjson"
 )
 
 // ProviderExecutor defines the contract required by Manager to execute provider calls.
@@ -65,6 +66,8 @@ const (
 	refreshFailureBackoff = 5 * time.Minute
 	quotaBackoffBase      = time.Second
 	quotaBackoffMax       = 30 * time.Minute
+
+	authWideQuotaReasonCodexUsageLimit = "codex_usage_limit_reached"
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -1738,11 +1741,14 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				state.Unavailable = true
 				state.Status = StatusError
 				state.UpdatedAt = now
+				disableAuth := false
 				if result.Error != nil {
 					state.LastError = cloneError(result.Error)
 					state.StatusMessage = result.Error.Message
 					auth.LastError = cloneError(result.Error)
 					auth.StatusMessage = result.Error.Message
+				} else {
+					state.LastError = nil
 				}
 
 				statusCode := statusCodeFromResult(result.Error)
@@ -1758,6 +1764,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						state.NextRetryAfter = next
 						suspendReason = "unauthorized"
 						shouldSuspendModel = true
+						disableAuth = true
 					case 402, 403:
 						next := now.Add(30 * time.Minute)
 						state.NextRetryAfter = next
@@ -1768,6 +1775,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 						state.NextRetryAfter = next
 						suspendReason = "not_found"
 						shouldSuspendModel = true
+						disableAuth = true
 					case 429:
 						var next time.Time
 						backoffLevel := state.Quota.BackoffLevel
@@ -1805,6 +1813,13 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				auth.Status = StatusError
 				auth.UpdatedAt = now
 				updateAggregatedAvailability(auth, now)
+				if isCodexUsageLimitResult(result.Provider, result.Error) {
+					applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
+					auth.Quota.Reason = authWideQuotaReasonCodexUsageLimit
+				}
+				if disableAuth {
+					disableAuthAfterFatalStatus(auth, state, result.Error, statusCode, now)
+				}
 			} else {
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
 			}
@@ -1831,6 +1846,23 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 	}
 
 	m.hook.OnResult(ctx, result)
+}
+
+func isCodexUsageLimitResult(provider string, err *Error) bool {
+	if err == nil || err.StatusCode() != http.StatusTooManyRequests {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(provider), "codex") {
+		return false
+	}
+	message := strings.TrimSpace(err.Message)
+	if message == "" {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(gjson.Get(message, "error.type").String()), "usage_limit_reached") {
+		return true
+	}
+	return strings.Contains(strings.ToLower(message), "usage_limit_reached")
 }
 
 func ensureModelState(auth *Auth, model string) *ModelState {
@@ -2097,12 +2129,14 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 	case 401:
 		auth.StatusMessage = "unauthorized"
 		auth.NextRetryAfter = now.Add(30 * time.Minute)
+		disableAuthAfterFatalStatus(auth, nil, resultErr, statusCode, now)
 	case 402, 403:
 		auth.StatusMessage = "payment_required"
 		auth.NextRetryAfter = now.Add(30 * time.Minute)
 	case 404:
 		auth.StatusMessage = "not_found"
 		auth.NextRetryAfter = now.Add(12 * time.Hour)
+		disableAuthAfterFatalStatus(auth, nil, resultErr, statusCode, now)
 	case 429:
 		auth.StatusMessage = "quota exhausted"
 		auth.Quota.Exceeded = true
@@ -2130,6 +2164,37 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		if auth.StatusMessage == "" {
 			auth.StatusMessage = "request failed"
 		}
+	}
+}
+
+func disableAuthAfterFatalStatus(auth *Auth, state *ModelState, resultErr *Error, statusCode int, now time.Time) {
+	if auth == nil {
+		return
+	}
+	reason := "disabled after upstream error"
+	switch statusCode {
+	case 401:
+		reason = "disabled after upstream 401"
+	case 404:
+		reason = "disabled after upstream 404"
+	}
+	if resultErr != nil {
+		if trimmed := strings.TrimSpace(resultErr.Message); trimmed != "" {
+			reason = reason + ": " + trimmed
+		}
+	}
+	auth.Disabled = true
+	auth.Unavailable = false
+	auth.Status = StatusDisabled
+	auth.StatusMessage = reason
+	auth.NextRetryAfter = time.Time{}
+	auth.UpdatedAt = now
+	if state != nil {
+		state.Status = StatusDisabled
+		state.Unavailable = false
+		state.StatusMessage = reason
+		state.NextRetryAfter = time.Time{}
+		state.UpdatedAt = now
 	}
 }
 

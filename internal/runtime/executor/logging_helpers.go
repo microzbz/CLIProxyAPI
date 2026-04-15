@@ -22,6 +22,9 @@ const (
 	apiAttemptsKey = "API_UPSTREAM_ATTEMPTS"
 	apiRequestKey  = "API_REQUEST"
 	apiResponseKey = "API_RESPONSE"
+
+	apiUpstreamResponseTimestampKey   = "API_UPSTREAM_RESPONSE_TIMESTAMP"
+	apiUpstreamFirstChunkTimestampKey = "API_UPSTREAM_FIRST_CHUNK_TIMESTAMP"
 )
 
 // upstreamRequestLog captures the outbound upstream request details for logging.
@@ -107,6 +110,9 @@ func recordAPIResponseMetadata(ctx context.Context, cfg *config.Config, status i
 	}
 	attempts, attempt := ensureAttempt(ginCtx)
 	ensureResponseIntro(attempt)
+	if _, exists := ginCtx.Get(apiUpstreamResponseTimestampKey); !exists {
+		ginCtx.Set(apiUpstreamResponseTimestampKey, time.Now())
+	}
 
 	if status > 0 && !attempt.statusWritten {
 		attempt.response.WriteString(fmt.Sprintf("Status: %d\n", status))
@@ -159,6 +165,9 @@ func appendAPIResponseChunk(ctx context.Context, cfg *config.Config, chunk []byt
 	ginCtx := ginContextFrom(ctx)
 	if ginCtx == nil {
 		return
+	}
+	if _, exists := ginCtx.Get(apiUpstreamFirstChunkTimestampKey); !exists {
+		ginCtx.Set(apiUpstreamFirstChunkTimestampKey, time.Now())
 	}
 	attempts, attempt := ensureAttempt(ginCtx)
 	ensureResponseIntro(attempt)

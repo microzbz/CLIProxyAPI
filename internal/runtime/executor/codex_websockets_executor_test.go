@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -12,6 +13,75 @@ import (
 	sdkconfig "github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 	"github.com/tidwall/gjson"
 )
+
+func TestParseCodexWebsocketErrorRecognizesStatusWithoutType(t *testing.T) {
+	payload := []byte(`{"error":{"message":"Your authentication token has been invalidated. Please try signing in again.","type":"invalid_request_error","code":"token_invalidated"},"status":401}`)
+
+	err, ok := parseCodexWebsocketError(payload)
+	if !ok {
+		t.Fatalf("expected websocket error to be recognized")
+	}
+
+	sc, ok := err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("expected status coder, got %T", err)
+	}
+	if got := sc.StatusCode(); got != http.StatusUnauthorized {
+		t.Fatalf("status code = %d, want %d", got, http.StatusUnauthorized)
+	}
+}
+
+func TestParseCodexWebsocketErrorSetsRetryAfterForUsageLimitReached(t *testing.T) {
+	now := time.Now()
+	resetAt := now.Add(4 * time.Minute).Unix()
+	payload := []byte(`{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_at":` + itoa(resetAt) + `},"status":429}`)
+
+	err, ok := parseCodexWebsocketError(payload)
+	if !ok {
+		t.Fatalf("expected websocket error to be recognized")
+	}
+
+	rap, ok := err.(interface{ RetryAfter() *time.Duration })
+	if !ok {
+		t.Fatalf("expected retryAfter provider, got %T", err)
+	}
+	retryAfter := rap.RetryAfter()
+	if retryAfter == nil {
+		t.Fatalf("expected retryAfter, got nil")
+	}
+	if *retryAfter < 3*time.Minute || *retryAfter > 4*time.Minute+5*time.Second {
+		t.Fatalf("retryAfter = %v, want about 4m", *retryAfter)
+	}
+}
+
+func TestParseCodexWebsocketErrorTreatsUsageLimitReachedAs429WithoutStatus(t *testing.T) {
+	payload := []byte(`{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_in_seconds":120}}`)
+
+	err, ok := parseCodexWebsocketError(payload)
+	if !ok {
+		t.Fatalf("expected websocket error to be recognized")
+	}
+
+	sc, ok := err.(interface{ StatusCode() int })
+	if !ok {
+		t.Fatalf("expected status coder, got %T", err)
+	}
+	if got := sc.StatusCode(); got != http.StatusTooManyRequests {
+		t.Fatalf("status code = %d, want %d", got, http.StatusTooManyRequests)
+	}
+
+	rap, ok := err.(interface{ RetryAfter() *time.Duration })
+	if !ok {
+		t.Fatalf("expected retryAfter provider, got %T", err)
+	}
+	retryAfter := rap.RetryAfter()
+	if retryAfter == nil {
+		t.Fatalf("expected retryAfter, got nil")
+	}
+	if *retryAfter != 120*time.Second {
+		t.Fatalf("retryAfter = %v, want %v", *retryAfter, 120*time.Second)
+	}
+}
 
 func TestBuildCodexWebsocketRequestBodyPreservesPreviousResponseID(t *testing.T) {
 	body := []byte(`{"model":"gpt-5-codex","previous_response_id":"resp-1","input":[{"type":"message","id":"msg-1"}]}`)

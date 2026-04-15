@@ -286,13 +286,7 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	var err error
 	if existing, ok := s.coreManager.GetByID(auth.ID); ok {
 		auth.CreatedAt = existing.CreatedAt
-		if !existing.Disabled && existing.Status != coreauth.StatusDisabled && !auth.Disabled && auth.Status != coreauth.StatusDisabled {
-			auth.LastRefreshedAt = existing.LastRefreshedAt
-			auth.NextRefreshAfter = existing.NextRefreshAfter
-			if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
-				auth.ModelStates = existing.ModelStates
-			}
-		}
+		preserveExistingRuntimeStateForAuthUpdate(auth, existing)
 		op = "update"
 		_, err = s.coreManager.Update(ctx, auth)
 	} else {
@@ -318,6 +312,84 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 	// have an empty supportedModelSet (because Register/Update upserts into the
 	// scheduler before registerModelsForAuth runs) and are invisible to the scheduler.
 	s.coreManager.RefreshSchedulerEntry(auth.ID)
+}
+
+func preserveExistingRuntimeStateForAuthUpdate(target, existing *coreauth.Auth) {
+	if target == nil || existing == nil {
+		return
+	}
+	if existing.Disabled || existing.Status == coreauth.StatusDisabled {
+		return
+	}
+	if target.Disabled || target.Status == coreauth.StatusDisabled {
+		return
+	}
+
+	target.LastRefreshedAt = existing.LastRefreshedAt
+	target.NextRefreshAfter = existing.NextRefreshAfter
+	if shouldPreserveAuthFailureState(target) {
+		target.Status = existing.Status
+		target.StatusMessage = existing.StatusMessage
+		target.Unavailable = existing.Unavailable
+		target.NextRetryAfter = existing.NextRetryAfter
+		target.Quota = existing.Quota
+		target.LastError = cloneServiceAuthError(existing.LastError)
+	}
+	if len(target.ModelStates) == 0 && len(existing.ModelStates) > 0 {
+		target.ModelStates = cloneServiceModelStates(existing.ModelStates)
+	}
+}
+
+func shouldPreserveAuthFailureState(auth *coreauth.Auth) bool {
+	if auth == nil {
+		return false
+	}
+	if auth.Unavailable {
+		return false
+	}
+	if !auth.NextRetryAfter.IsZero() {
+		return false
+	}
+	if auth.Quota.Exceeded || auth.Quota.BackoffLevel != 0 || !auth.Quota.NextRecoverAt.IsZero() || strings.TrimSpace(auth.Quota.Reason) != "" {
+		return false
+	}
+	if auth.LastError != nil {
+		return false
+	}
+	if strings.TrimSpace(auth.StatusMessage) != "" {
+		return false
+	}
+	switch auth.Status {
+	case "", coreauth.StatusUnknown, coreauth.StatusActive:
+		return true
+	default:
+		return false
+	}
+}
+
+func cloneServiceAuthError(err *coreauth.Error) *coreauth.Error {
+	if err == nil {
+		return nil
+	}
+	return &coreauth.Error{
+		Code:       err.Code,
+		Message:    err.Message,
+		Retryable:  err.Retryable,
+		HTTPStatus: err.HTTPStatus,
+	}
+}
+
+func cloneServiceModelStates(states map[string]*coreauth.ModelState) map[string]*coreauth.ModelState {
+	if len(states) == 0 {
+		return nil
+	}
+	cloned := make(map[string]*coreauth.ModelState, len(states))
+	for key, state := range states {
+		if state != nil {
+			cloned[key] = state.Clone()
+		}
+	}
+	return cloned
 }
 
 func (s *Service) applyCoreAuthRemoval(ctx context.Context, id string) {
@@ -876,21 +948,27 @@ func (s *Service) registerModelsForAuth(a *coreauth.Auth) {
 		}
 		models = applyExcludedModels(models, excluded)
 	case "codex":
-		codexPlanType := ""
-		if a.Attributes != nil {
-			codexPlanType = strings.TrimSpace(a.Attributes["plan_type"])
-		}
-		switch strings.ToLower(codexPlanType) {
-		case "pro":
+		// Preserve the legacy OAuth behavior: Codex OAuth accounts expose the full
+		// catalog regardless of the ChatGPT plan_type embedded in the JWT.
+		if authKind != "apikey" {
 			models = registry.GetCodexProModels()
-		case "plus":
-			models = registry.GetCodexPlusModels()
-		case "team", "business", "go":
-			models = registry.GetCodexTeamModels()
-		case "free":
-			models = registry.GetCodexFreeModels()
-		default:
-			models = registry.GetCodexProModels()
+		} else {
+			codexPlanType := ""
+			if a.Attributes != nil {
+				codexPlanType = strings.TrimSpace(a.Attributes["plan_type"])
+			}
+			switch strings.ToLower(codexPlanType) {
+			case "pro":
+				models = registry.GetCodexProModels()
+			case "plus":
+				models = registry.GetCodexPlusModels()
+			case "team", "business", "go":
+				models = registry.GetCodexTeamModels()
+			case "free":
+				models = registry.GetCodexFreeModels()
+			default:
+				models = registry.GetCodexProModels()
+			}
 		}
 		if entry := s.resolveConfigCodexKey(a); entry != nil {
 			if len(entry.Models) > 0 {

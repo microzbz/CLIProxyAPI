@@ -6,6 +6,19 @@ import (
 	"github.com/tidwall/gjson"
 )
 
+func TestConvertOpenAIRequestToCodex_NormalizesMinimalReasoningEffort(t *testing.T) {
+	input := []byte(`{
+		"model": "gpt-5.4",
+		"messages": [{"role": "user", "content": "hello"}],
+		"reasoning_effort": "minimal"
+	}`)
+
+	out := ConvertOpenAIRequestToCodex("gpt-5.4", input, false)
+	if got := gjson.GetBytes(out, "reasoning.effort").String(); got != "low" {
+		t.Fatalf("reasoning.effort = %q, want %q: %s", got, "low", string(out))
+	}
+}
+
 // Basic tool-call: system + user + assistant(tool_calls, no content) + tool result.
 // Expects developer msg + user msg + function_call + function_call_output.
 // No empty assistant message should appear between user and function_call.

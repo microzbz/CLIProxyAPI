@@ -133,3 +133,17 @@ func TestConvertClaudeRequestToCodex_ParallelToolCalls(t *testing.T) {
 		})
 	}
 }
+
+func TestConvertClaudeRequestToCodex_NormalizesMinimalReasoningEffort(t *testing.T) {
+	input := []byte(`{
+		"model": "claude-4.6",
+		"output_config": {"effort": "minimal"},
+		"thinking": {"type": "adaptive"},
+		"messages": [{"role": "user", "content": "hello"}]
+	}`)
+
+	out := ConvertClaudeRequestToCodex("claude-4.6", input, false)
+	if got := gjson.GetBytes(out, "reasoning.effort").String(); got != "low" {
+		t.Fatalf("reasoning.effort = %q, want %q: %s", got, "low", string(out))
+	}
+}

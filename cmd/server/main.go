@@ -252,19 +252,22 @@ func main() {
 			log.Errorf("failed to initialize postgres token store: %v", err)
 			return
 		}
-		examplePath := filepath.Join(wd, "config.example.yaml")
 		ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
-		if errBootstrap := pgStoreInst.Bootstrap(ctx, examplePath); errBootstrap != nil {
+		if errBootstrap := pgStoreInst.Bootstrap(ctx, ""); errBootstrap != nil {
 			cancel()
-			log.Errorf("failed to bootstrap postgres-backed config: %v", errBootstrap)
+			log.Errorf("failed to bootstrap postgres-backed auth workspace: %v", errBootstrap)
 			return
 		}
 		cancel()
-		configFilePath = pgStoreInst.ConfigPath()
+		if configPath != "" {
+			configFilePath = configPath
+		} else {
+			configFilePath = filepath.Join(wd, "config.yaml")
+		}
 		cfg, err = config.LoadConfigOptional(configFilePath, isCloudDeploy)
 		if err == nil {
 			cfg.AuthDir = pgStoreInst.AuthDir()
-			log.Infof("postgres-backed token store enabled, workspace path: %s", pgStoreInst.WorkDir())
+			log.Infof("postgres-backed token store enabled, workspace path: %s; config path: %s", pgStoreInst.WorkDir(), configFilePath)
 		}
 	} else if useObjectStore {
 		if objectStoreLocalPath == "" {
@@ -453,6 +456,11 @@ func main() {
 		sdkAuth.RegisterTokenStore(gitStoreInst)
 	} else {
 		sdkAuth.RegisterTokenStore(sdkAuth.NewFileTokenStore())
+	}
+	if pgStoreInst != nil {
+		usage.GetRequestStatistics().SetPersistentStore(pgStoreInst)
+	} else {
+		usage.GetRequestStatistics().SetPersistentStore(nil)
 	}
 
 	// Register built-in access providers before constructing services.

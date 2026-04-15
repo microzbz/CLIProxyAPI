@@ -13,6 +13,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
+	log "github.com/sirupsen/logrus"
 )
 
 var statisticsEnabled atomic.Bool
@@ -71,6 +72,8 @@ type RequestStatistics struct {
 	requestsByHour map[int]int64
 	tokensByDay    map[string]int64
 	tokensByHour   map[int]int64
+
+	persistentStore PersistentStore
 }
 
 // apiStats holds aggregated metrics for a single API key.
@@ -151,6 +154,58 @@ func NewRequestStatistics() *RequestStatistics {
 	}
 }
 
+// SetPersistentStore attaches an optional durable backend.
+func (s *RequestStatistics) SetPersistentStore(store PersistentStore) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.persistentStore = store
+	s.mu.Unlock()
+}
+
+func (s *RequestStatistics) persistent() PersistentStore {
+	if s == nil {
+		return nil
+	}
+	s.mu.RLock()
+	store := s.persistentStore
+	s.mu.RUnlock()
+	return store
+}
+
+// UsageBackend reports how usage data is currently stored.
+func (s *RequestStatistics) UsageBackend() string {
+	if s.persistent() != nil {
+		return "postgres"
+	}
+	return "memory"
+}
+
+// GetUsageRetentionDays returns the effective retention setting.
+func (s *RequestStatistics) GetUsageRetentionDays(ctx context.Context) (int, error) {
+	store := s.persistent()
+	if store == nil {
+		return DefaultRetentionDays, nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return store.GetUsageRetentionDays(ctx)
+}
+
+// SetUsageRetentionDays updates retention on the durable backend.
+func (s *RequestStatistics) SetUsageRetentionDays(ctx context.Context, days int) error {
+	store := s.persistent()
+	if store == nil {
+		return ErrUsageRetentionUnsupported
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return store.SetUsageRetentionDays(ctx, NormalizeRetentionDays(days))
+}
+
 // Record ingests a new usage record and updates the aggregates.
 func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record) {
 	if s == nil {
@@ -177,6 +232,25 @@ func (s *RequestStatistics) Record(ctx context.Context, record coreusage.Record)
 	modelName := record.Model
 	if modelName == "" {
 		modelName = "unknown"
+	}
+	if store := s.persistent(); store != nil {
+		persistCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := store.SaveUsageRecord(persistCtx, PersistentRecord{
+			APIName:     statsKey,
+			Provider:    record.Provider,
+			Model:       modelName,
+			AuthID:      record.AuthID,
+			AuthIndex:   record.AuthIndex,
+			Source:      record.Source,
+			RequestedAt: timestamp,
+			LatencyMs:   normaliseLatency(record.Latency),
+			Failed:      failed,
+			Tokens:      detail,
+		}); err != nil {
+			log.WithError(err).Warn("usage: failed to persist usage record")
+		}
+		return
 	}
 	dayKey := timestamp.Format("2006-01-02")
 	hourKey := timestamp.Hour()
@@ -227,6 +301,16 @@ func (s *RequestStatistics) updateAPIStats(stats *apiStats, model string, detail
 
 // Snapshot returns a copy of the aggregated metrics for external consumption.
 func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
+	if store := s.persistent(); store != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		snapshot, err := store.LoadUsageSnapshot(ctx)
+		if err != nil {
+			log.WithError(err).Warn("usage: failed to load persisted usage snapshot")
+			return StatisticsSnapshot{}
+		}
+		return snapshot
+	}
 	result := StatisticsSnapshot{}
 	if s == nil {
 		return result
@@ -295,6 +379,16 @@ func (s *RequestStatistics) MergeSnapshot(snapshot StatisticsSnapshot) MergeResu
 	result := MergeResult{}
 	if s == nil {
 		return result
+	}
+	if store := s.persistent(); store != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		merged, err := store.MergeUsageSnapshot(ctx, snapshot)
+		if err != nil {
+			log.WithError(err).Warn("usage: failed to merge persisted usage snapshot")
+			return result
+		}
+		return merged
 	}
 
 	s.mu.Lock()

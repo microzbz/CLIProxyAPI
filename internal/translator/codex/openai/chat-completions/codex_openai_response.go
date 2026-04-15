@@ -10,6 +10,7 @@ import (
 	"context"
 	"time"
 
+	codexcommon "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/codex/openai/common"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -235,36 +236,39 @@ func ConvertCodexResponseToOpenAI(_ context.Context, modelName string, originalR
 // Returns:
 //   - []byte: An OpenAI-compatible JSON response containing all message content and metadata
 func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) []byte {
+	if len(codexcommon.CollectCodexSSEDataLines(rawJSON)) > 0 {
+		agg := codexcommon.AggregateCodexSSE(rawJSON)
+		if len(agg.CompletedResponseRaw) == 0 {
+			return []byte{}
+		}
+		return buildOpenAINonStreamFromCodexResponse(originalRequestRawJSON, gjson.ParseBytes(agg.CompletedResponseRaw), agg.MessageText, agg.ReasoningText, agg.OutputItems)
+	}
+
 	rootResult := gjson.ParseBytes(rawJSON)
 	// Verify this is a response.completed event
 	if rootResult.Get("type").String() != "response.completed" {
 		return []byte{}
 	}
 
+	return buildOpenAINonStreamFromCodexResponse(originalRequestRawJSON, rootResult.Get("response"), "", "", nil)
+}
+
+func buildOpenAINonStreamFromCodexResponse(originalRequestRawJSON []byte, responseResult gjson.Result, contentFallback string, reasoningFallback string, outputItems [][]byte) []byte {
 	unixTimestamp := time.Now().Unix()
-
-	responseResult := rootResult.Get("response")
-
 	template := []byte(`{"id":"","object":"chat.completion","created":123456,"model":"model","choices":[{"index":0,"message":{"role":"assistant","content":null,"reasoning_content":null,"tool_calls":null},"finish_reason":null,"native_finish_reason":null}]}`)
 
-	// Extract and set the model version.
 	if modelResult := responseResult.Get("model"); modelResult.Exists() {
 		template, _ = sjson.SetBytes(template, "model", modelResult.String())
 	}
-
-	// Extract and set the creation timestamp.
 	if createdAtResult := responseResult.Get("created_at"); createdAtResult.Exists() {
 		template, _ = sjson.SetBytes(template, "created", createdAtResult.Int())
 	} else {
 		template, _ = sjson.SetBytes(template, "created", unixTimestamp)
 	}
-
-	// Extract and set the response ID.
 	if idResult := responseResult.Get("id"); idResult.Exists() {
 		template, _ = sjson.SetBytes(template, "id", idResult.String())
 	}
 
-	// Extract and set usage metadata (token counts).
 	if usageResult := responseResult.Get("usage"); usageResult.Exists() {
 		if outputTokensResult := usageResult.Get("output_tokens"); outputTokensResult.Exists() {
 			template, _ = sjson.SetBytes(template, "usage.completion_tokens", outputTokensResult.Int())
@@ -283,93 +287,82 @@ func ConvertCodexResponseToOpenAINonStream(_ context.Context, _ string, original
 		}
 	}
 
-	// Process the output array for content and function calls
-	outputResult := responseResult.Get("output")
-	if outputResult.IsArray() {
-		outputArray := outputResult.Array()
-		var contentText string
-		var reasoningText string
-		var toolCalls [][]byte
+	outputArray := make([]gjson.Result, 0)
+	if len(outputItems) > 0 {
+		for _, itemRaw := range outputItems {
+			outputArray = append(outputArray, gjson.ParseBytes(itemRaw))
+		}
+	} else if outputResult := responseResult.Get("output"); outputResult.IsArray() {
+		outputArray = append(outputArray, outputResult.Array()...)
+	}
 
-		for _, outputItem := range outputArray {
-			outputType := outputItem.Get("type").String()
+	contentText := contentFallback
+	reasoningText := reasoningFallback
+	var toolCalls [][]byte
 
-			switch outputType {
-			case "reasoning":
-				// Extract reasoning content from summary
+	for _, outputItem := range outputArray {
+		switch outputItem.Get("type").String() {
+		case "reasoning":
+			if reasoningText == "" {
 				if summaryResult := outputItem.Get("summary"); summaryResult.IsArray() {
-					summaryArray := summaryResult.Array()
-					for _, summaryItem := range summaryArray {
-						if summaryItem.Get("type").String() == "summary_text" {
-							reasoningText = summaryItem.Get("text").String()
-							break
+					for _, summaryItem := range summaryResult.Array() {
+						if summaryItem.Get("type").String() != "summary_text" {
+							continue
 						}
+						reasoningText += summaryItem.Get("text").String()
 					}
 				}
-			case "message":
-				// Extract message content
+			}
+		case "message":
+			if contentText == "" {
 				if contentResult := outputItem.Get("content"); contentResult.IsArray() {
-					contentArray := contentResult.Array()
-					for _, contentItem := range contentArray {
-						if contentItem.Get("type").String() == "output_text" {
-							contentText = contentItem.Get("text").String()
-							break
+					for _, contentItem := range contentResult.Array() {
+						if contentItem.Get("type").String() != "output_text" {
+							continue
 						}
+						contentText += contentItem.Get("text").String()
 					}
 				}
-			case "function_call":
-				// Handle function call content
-				functionCallTemplate := []byte(`{"id":"","type":"function","function":{"name":"","arguments":""}}`)
-
-				if callIdResult := outputItem.Get("call_id"); callIdResult.Exists() {
-					functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "id", callIdResult.String())
-				}
-
-				if nameResult := outputItem.Get("name"); nameResult.Exists() {
-					n := nameResult.String()
-					rev := buildReverseMapFromOriginalOpenAI(originalRequestRawJSON)
-					if orig, ok := rev[n]; ok {
-						n = orig
-					}
-					functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "function.name", n)
-				}
-
-				if argsResult := outputItem.Get("arguments"); argsResult.Exists() {
-					functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "function.arguments", argsResult.String())
-				}
-
-				toolCalls = append(toolCalls, functionCallTemplate)
 			}
-		}
-
-		// Set content and reasoning content if found
-		if contentText != "" {
-			template, _ = sjson.SetBytes(template, "choices.0.message.content", contentText)
-			template, _ = sjson.SetBytes(template, "choices.0.message.role", "assistant")
-		}
-
-		if reasoningText != "" {
-			template, _ = sjson.SetBytes(template, "choices.0.message.reasoning_content", reasoningText)
-			template, _ = sjson.SetBytes(template, "choices.0.message.role", "assistant")
-		}
-
-		// Add tool calls if any
-		if len(toolCalls) > 0 {
-			template, _ = sjson.SetRawBytes(template, "choices.0.message.tool_calls", []byte(`[]`))
-			for _, toolCall := range toolCalls {
-				template, _ = sjson.SetRawBytes(template, "choices.0.message.tool_calls.-1", toolCall)
+		case "function_call":
+			functionCallTemplate := []byte(`{"id":"","type":"function","function":{"name":"","arguments":""}}`)
+			if callID := outputItem.Get("call_id"); callID.Exists() {
+				functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "id", callID.String())
 			}
-			template, _ = sjson.SetBytes(template, "choices.0.message.role", "assistant")
+			if nameResult := outputItem.Get("name"); nameResult.Exists() {
+				name := nameResult.String()
+				rev := buildReverseMapFromOriginalOpenAI(originalRequestRawJSON)
+				if orig, ok := rev[name]; ok {
+					name = orig
+				}
+				functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "function.name", name)
+			}
+			if argsResult := outputItem.Get("arguments"); argsResult.Exists() {
+				functionCallTemplate, _ = sjson.SetBytes(functionCallTemplate, "function.arguments", argsResult.String())
+			}
+			toolCalls = append(toolCalls, functionCallTemplate)
 		}
 	}
 
-	// Extract and set the finish reason based on status
-	if statusResult := responseResult.Get("status"); statusResult.Exists() {
-		status := statusResult.String()
-		if status == "completed" {
-			template, _ = sjson.SetBytes(template, "choices.0.finish_reason", "stop")
-			template, _ = sjson.SetBytes(template, "choices.0.native_finish_reason", "stop")
+	if contentText != "" {
+		template, _ = sjson.SetBytes(template, "choices.0.message.content", contentText)
+		template, _ = sjson.SetBytes(template, "choices.0.message.role", "assistant")
+	}
+	if reasoningText != "" {
+		template, _ = sjson.SetBytes(template, "choices.0.message.reasoning_content", reasoningText)
+		template, _ = sjson.SetBytes(template, "choices.0.message.role", "assistant")
+	}
+	if len(toolCalls) > 0 {
+		template, _ = sjson.SetRawBytes(template, "choices.0.message.tool_calls", []byte(`[]`))
+		for _, toolCall := range toolCalls {
+			template, _ = sjson.SetRawBytes(template, "choices.0.message.tool_calls.-1", toolCall)
 		}
+		template, _ = sjson.SetBytes(template, "choices.0.message.role", "assistant")
+		template, _ = sjson.SetBytes(template, "choices.0.finish_reason", "tool_calls")
+		template, _ = sjson.SetBytes(template, "choices.0.native_finish_reason", "tool_calls")
+	} else if status := responseResult.Get("status").String(); status == "completed" || status == "" {
+		template, _ = sjson.SetBytes(template, "choices.0.finish_reason", "stop")
+		template, _ = sjson.SetBytes(template, "choices.0.native_finish_reason", "stop")
 	}
 
 	return template

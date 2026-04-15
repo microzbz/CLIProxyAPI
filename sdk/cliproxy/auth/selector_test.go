@@ -311,6 +311,78 @@ func TestIsAuthBlockedForModel_UnavailableWithoutNextRetryIsNotBlocked(t *testin
 	}
 }
 
+func TestIsAuthBlockedForModel_CodexUsageLimitBlocksAcrossModels(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	next := now.Add(5 * time.Minute)
+	auth := &Auth{
+		ID: "a",
+		ModelStates: map[string]*ModelState{
+			"other-model": {
+				Status: StatusActive,
+			},
+		},
+		Quota: QuotaState{
+			Exceeded:      true,
+			Reason:        authWideQuotaReasonCodexUsageLimit,
+			NextRecoverAt: next,
+		},
+		NextRetryAfter: next,
+	}
+
+	blocked, reason, gotNext := isAuthBlockedForModel(auth, "other-model", now)
+	if !blocked {
+		t.Fatalf("blocked = false, want true")
+	}
+	if reason != blockReasonCooldown {
+		t.Fatalf("reason = %v, want %v", reason, blockReasonCooldown)
+	}
+	if !gotNext.Equal(next) {
+		t.Fatalf("next = %v, want %v", gotNext, next)
+	}
+}
+
+func TestIsAuthBlockedForModel_GenericQuotaDoesNotBlockOtherModels(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	next := now.Add(5 * time.Minute)
+	auth := &Auth{
+		ID: "a",
+		ModelStates: map[string]*ModelState{
+			"rate-limited-model": {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: next,
+				Quota: QuotaState{
+					Exceeded:      true,
+					Reason:        "quota",
+					NextRecoverAt: next,
+				},
+			},
+		},
+		Unavailable:    true,
+		NextRetryAfter: next,
+		Quota: QuotaState{
+			Exceeded:      true,
+			Reason:        "quota",
+			NextRecoverAt: next,
+		},
+	}
+
+	blocked, reason, gotNext := isAuthBlockedForModel(auth, "other-model", now)
+	if blocked {
+		t.Fatalf("blocked = true, want false")
+	}
+	if reason != blockReasonNone {
+		t.Fatalf("reason = %v, want %v", reason, blockReasonNone)
+	}
+	if !gotNext.IsZero() {
+		t.Fatalf("next = %v, want zero", gotNext)
+	}
+}
+
 func TestFillFirstSelectorPick_ThinkingSuffixFallsBackToBaseModelState(t *testing.T) {
 	t.Parallel()
 

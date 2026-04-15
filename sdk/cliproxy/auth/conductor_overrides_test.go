@@ -3,6 +3,7 @@ package auth
 import (
 	"context"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -258,6 +259,138 @@ func TestManager_MaxRetryCredentials_LimitsCrossCredentialRetries(t *testing.T) 
 				t.Fatalf("expected 2 calls with max-retry-credentials=0, got %d", calls)
 			}
 		})
+	}
+}
+
+func TestManager_MarkResult_DisablesAuthOn401And404(t *testing.T) {
+	testCases := []struct {
+		name       string
+		result     Result
+		wantStatus int
+		wantReason string
+	}{
+		{
+			name: "model scoped 401",
+			result: Result{
+				AuthID:   "auth-401",
+				Provider: "claude",
+				Model:    "claude-sonnet",
+				Success:  false,
+				Error:    &Error{HTTPStatus: http.StatusUnauthorized, Message: "token expired"},
+			},
+			wantStatus: http.StatusUnauthorized,
+			wantReason: "401",
+		},
+		{
+			name: "auth scoped 404",
+			result: Result{
+				AuthID:   "auth-404",
+				Provider: "claude",
+				Success:  false,
+				Error:    &Error{HTTPStatus: http.StatusNotFound, Message: "model not found"},
+			},
+			wantStatus: http.StatusNotFound,
+			wantReason: "404",
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			m := NewManager(nil, nil, nil)
+			auth := &Auth{ID: tc.result.AuthID, Provider: "claude"}
+			if _, err := m.Register(context.Background(), auth); err != nil {
+				t.Fatalf("register auth: %v", err)
+			}
+
+			m.MarkResult(context.Background(), tc.result)
+
+			got, ok := m.GetByID(tc.result.AuthID)
+			if !ok || got == nil {
+				t.Fatalf("expected auth %s to exist after MarkResult", tc.result.AuthID)
+			}
+			if !got.Disabled {
+				t.Fatalf("expected auth to be disabled")
+			}
+			if got.Status != StatusDisabled {
+				t.Fatalf("status = %s, want %s", got.Status, StatusDisabled)
+			}
+			if !got.NextRetryAfter.IsZero() {
+				t.Fatalf("next retry after = %v, want zero", got.NextRetryAfter)
+			}
+			if got.LastError == nil || got.LastError.HTTPStatus != tc.wantStatus {
+				t.Fatalf("last error = %#v, want http status %d", got.LastError, tc.wantStatus)
+			}
+			if !strings.Contains(got.StatusMessage, tc.wantReason) {
+				t.Fatalf("status message = %q, want substring %q", got.StatusMessage, tc.wantReason)
+			}
+			if tc.result.Model != "" {
+				state := got.ModelStates[tc.result.Model]
+				if state == nil {
+					t.Fatalf("expected model state for %s", tc.result.Model)
+				}
+				if state.Status != StatusDisabled {
+					t.Fatalf("model status = %s, want %s", state.Status, StatusDisabled)
+				}
+			}
+		})
+	}
+}
+
+func TestManager_MarkResult_CodexUsageLimitReachedSetsAuthWideCooldown(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+
+	auth := &Auth{
+		ID:       "codex-auth",
+		Provider: "codex",
+		ModelStates: map[string]*ModelState{
+			"other-model": {
+				Status: StatusActive,
+			},
+		},
+	}
+	if _, err := m.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	retryAfter := 2 * time.Minute
+	m.MarkResult(context.Background(), Result{
+		AuthID:     auth.ID,
+		Provider:   "codex",
+		Model:      "gpt-5.4",
+		Success:    false,
+		RetryAfter: &retryAfter,
+		Error: &Error{
+			HTTPStatus: http.StatusTooManyRequests,
+			Message:    `{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_in_seconds":120}}`,
+		},
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	if !updated.Quota.Exceeded {
+		t.Fatalf("expected auth quota to be exceeded")
+	}
+	if updated.Quota.Reason != authWideQuotaReasonCodexUsageLimit {
+		t.Fatalf("quota reason = %q, want %q", updated.Quota.Reason, authWideQuotaReasonCodexUsageLimit)
+	}
+	if updated.NextRetryAfter.IsZero() || !updated.NextRetryAfter.After(time.Now()) {
+		t.Fatalf("next retry after = %v, want future time", updated.NextRetryAfter)
+	}
+	if updated.Quota.NextRecoverAt.IsZero() || !updated.Quota.NextRecoverAt.After(time.Now()) {
+		t.Fatalf("quota next recover at = %v, want future time", updated.Quota.NextRecoverAt)
+	}
+
+	blocked, reason, next := isAuthBlockedForModel(updated, "other-model", time.Now())
+	if !blocked {
+		t.Fatalf("blocked = false, want true")
+	}
+	if reason != blockReasonCooldown {
+		t.Fatalf("reason = %v, want %v", reason, blockReasonCooldown)
+	}
+	if next.IsZero() || !next.After(time.Now()) {
+		t.Fatalf("next = %v, want future time", next)
 	}
 }
 

@@ -85,7 +85,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			expectField: "",
 			expectErr:   true,
 		},
-		// Case 4: Level none → clamped to minimal (ZeroAllowed=false)
+		// Case 4: Level none → normalized to low for Codex
 		{
 			name:        "4",
 			from:        "openai",
@@ -93,7 +93,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			model:       "level-model(none)",
 			inputJSON:   `{"model":"level-model(none)","messages":[{"role":"user","content":"hi"}]}`,
 			expectField: "reasoning.effort",
-			expectValue: "minimal",
+			expectValue: "low",
 			expectErr:   false,
 		},
 		// Case 5: Level auto → DynamicAllowed=false → medium (mid-range)
@@ -140,7 +140,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			expectValue: "high",
 			expectErr:   false,
 		},
-		// Case 9: Budget 0 → clamped to minimal (ZeroAllowed=false)
+		// Case 9: Budget 0 → normalized to low for Codex
 		{
 			name:        "9",
 			from:        "gemini",
@@ -148,7 +148,7 @@ func TestThinkingE2EMatrix_Suffix(t *testing.T) {
 			model:       "level-model(0)",
 			inputJSON:   `{"model":"level-model(0)","contents":[{"role":"user","parts":[{"text":"hi"}]}]}`,
 			expectField: "reasoning.effort",
-			expectValue: "minimal",
+			expectValue: "low",
 			expectErr:   false,
 		},
 		// Case 10: Budget -1 → auto → DynamicAllowed=false → medium (mid-range)
@@ -1369,7 +1369,7 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			expectField: "",
 			expectErr:   true,
 		},
-		// Case 4: reasoning_effort=none → clamped to minimal
+		// Case 4: reasoning_effort=none → normalized to low for Codex
 		{
 			name:        "4",
 			from:        "openai",
@@ -1377,7 +1377,7 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			model:       "level-model",
 			inputJSON:   `{"model":"level-model","messages":[{"role":"user","content":"hi"}],"reasoning_effort":"none"}`,
 			expectField: "reasoning.effort",
-			expectValue: "minimal",
+			expectValue: "low",
 			expectErr:   false,
 		},
 		// Case 5: reasoning_effort=auto → medium (DynamicAllowed=false)
@@ -1424,7 +1424,7 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			expectValue: "high",
 			expectErr:   false,
 		},
-		// Case 9: thinkingBudget=0 → clamped to minimal
+		// Case 9: thinkingBudget=0 → normalized to low for Codex
 		{
 			name:        "9",
 			from:        "gemini",
@@ -1432,7 +1432,7 @@ func TestThinkingE2EMatrix_Body(t *testing.T) {
 			model:       "level-model",
 			inputJSON:   `{"model":"level-model","contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"thinkingConfig":{"thinkingBudget":0}}}`,
 			expectField: "reasoning.effort",
-			expectValue: "minimal",
+			expectValue: "low",
 			expectErr:   false,
 		},
 		// Case 10: thinkingBudget=-1 → medium (DynamicAllowed=false)
@@ -2975,7 +2975,7 @@ func TestThinkingE2EClaudeAdaptive_Body(t *testing.T) {
 			model:       "level-model",
 			inputJSON:   `{"model":"level-model","messages":[{"role":"user","content":"hi"}],"thinking":{"type":"adaptive"},"output_config":{"effort":"minimal"}}`,
 			expectField: "reasoning.effort",
-			expectValue: "minimal",
+			expectValue: "low",
 			expectErr:   false,
 		},
 		{

@@ -18,7 +18,7 @@ pprof:
   enable: false
   addr: "127.0.0.1:18316"
 commercial-mode: false
-logging-to-file: true
+logging-to-file: false
 request-log: true
 logs-max-total-size-mb: 0
 error-logs-max-files: 10

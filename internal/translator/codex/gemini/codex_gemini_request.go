@@ -251,7 +251,7 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 				thinkingLevel = thinkingConfig.Get("thinking_level")
 			}
 			if thinkingLevel.Exists() {
-				effort := strings.ToLower(strings.TrimSpace(thinkingLevel.String()))
+				effort := thinking.NormalizeOpenAIEffort(thinkingLevel.String())
 				if effort != "" {
 					out, _ = sjson.SetBytes(out, "reasoning.effort", effort)
 					effortSet = true
@@ -263,7 +263,7 @@ func ConvertGeminiRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 				}
 				if thinkingBudget.Exists() {
 					if effort, ok := thinking.ConvertBudgetToLevel(int(thinkingBudget.Int())); ok {
-						out, _ = sjson.SetBytes(out, "reasoning.effort", effort)
+						out, _ = sjson.SetBytes(out, "reasoning.effort", thinking.NormalizeOpenAIEffort(effort))
 						effortSet = true
 					}
 				}

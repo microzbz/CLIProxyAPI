@@ -133,6 +133,23 @@ func MapToClaudeEffort(level string, supportsMax bool) (string, bool) {
 	}
 }
 
+// NormalizeOpenAIEffort normalizes generic thinking levels for OpenAI/Codex
+// style effort fields.
+//
+// Today the only compatibility rewrite we need is:
+//   - minimal -> low
+//
+// Other valid values are preserved as-is after lowercasing/trimming.
+func NormalizeOpenAIEffort(level string) string {
+	level = strings.ToLower(strings.TrimSpace(level))
+	switch level {
+	case "minimal":
+		return "low"
+	default:
+		return level
+	}
+}
+
 // ModelCapability describes the thinking format support of a model.
 type ModelCapability int
 

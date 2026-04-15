@@ -90,3 +90,36 @@ func TestConvertCodexResponseToOpenAI_ToolCallArgumentsDeltaOmitsNullContentFiel
 		t.Fatalf("expected tool call arguments delta to exist, got %s", string(out[0]))
 	}
 }
+
+func TestConvertCodexResponseToOpenAINonStream_AggregatesSSEWhenCompletedOutputEmpty(t *testing.T) {
+	raw := []byte(`event: response.created
+data: {"type":"response.created","response":{"id":"resp_123","created_at":1776221988,"model":"gpt-5.4","status":"in_progress","output":[]}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","item":{"id":"msg_123","type":"message","status":"in_progress","content":[],"role":"assistant"},"output_index":0,"sequence_number":2}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"你好","item_id":"msg_123","output_index":0,"sequence_number":4}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","content_index":0,"delta":"啊","item_id":"msg_123","output_index":0,"sequence_number":5}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","item":{"id":"msg_123","type":"message","status":"completed","content":[{"type":"output_text","annotations":[],"text":"你好啊"}],"role":"assistant"},"output_index":0,"sequence_number":24}
+
+event: response.completed
+data: {"type":"response.completed","response":{"id":"resp_123","object":"response","created_at":1776221988,"status":"completed","model":"gpt-5.4","output":[],"usage":{"input_tokens":8,"input_tokens_details":{"cached_tokens":0},"output_tokens":22,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":30}},"sequence_number":25}
+`)
+
+	out := ConvertCodexResponseToOpenAINonStream(context.Background(), "", nil, nil, raw, nil)
+
+	if got := gjson.GetBytes(out, "choices.0.message.content").String(); got != "你好啊" {
+		t.Fatalf("message.content = %q, want %q: %s", got, "你好啊", string(out))
+	}
+	if got := gjson.GetBytes(out, "choices.0.finish_reason").String(); got != "stop" {
+		t.Fatalf("finish_reason = %q, want %q: %s", got, "stop", string(out))
+	}
+	if got := gjson.GetBytes(out, "usage.completion_tokens").Int(); got != 22 {
+		t.Fatalf("completion_tokens = %d, want %d: %s", got, 22, string(out))
+	}
+}

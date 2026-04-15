@@ -182,8 +182,12 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 			reporter.publish(ctx, detail)
 		}
 
+		translateInput := line
+		if from == sdktranslator.FromString("openai") || from == sdktranslator.FromString("openai-response") {
+			translateInput = data
+		}
 		var param any
-		out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, line, &param)
+		out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, translateInput, &param)
 		resp = cliproxyexecutor.Response{Payload: out, Headers: httpResp.Header.Clone()}
 		return resp, nil
 	}
@@ -688,15 +692,26 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 }
 
 func newCodexStatusErr(statusCode int, body []byte) statusErr {
-	errCode := statusCode
-	if isCodexModelCapacityError(body) {
-		errCode = http.StatusTooManyRequests
-	}
+	errCode := normalizeCodexErrorStatus(statusCode, body)
 	err := statusErr{code: errCode, msg: string(body)}
 	if retryAfter := parseCodexRetryAfter(errCode, body, time.Now()); retryAfter != nil {
 		err.retryAfter = retryAfter
 	}
 	return err
+}
+
+func normalizeCodexErrorStatus(statusCode int, errorBody []byte) int {
+	if isCodexUsageLimitReached(errorBody) || isCodexModelCapacityError(errorBody) {
+		return http.StatusTooManyRequests
+	}
+	return statusCode
+}
+
+func isCodexUsageLimitReached(errorBody []byte) bool {
+	if len(errorBody) == 0 {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(gjson.GetBytes(errorBody, "error.type").String()), "usage_limit_reached")
 }
 
 func isCodexModelCapacityError(errorBody []byte) bool {
@@ -722,10 +737,13 @@ func isCodexModelCapacityError(errorBody []byte) bool {
 }
 
 func parseCodexRetryAfter(statusCode int, errorBody []byte, now time.Time) *time.Duration {
-	if statusCode != http.StatusTooManyRequests || len(errorBody) == 0 {
+	if len(errorBody) == 0 {
 		return nil
 	}
-	if strings.TrimSpace(gjson.GetBytes(errorBody, "error.type").String()) != "usage_limit_reached" {
+	if !isCodexUsageLimitReached(errorBody) {
+		return nil
+	}
+	if normalizeCodexErrorStatus(statusCode, errorBody) != http.StatusTooManyRequests {
 		return nil
 	}
 	if resetsAt := gjson.GetBytes(errorBody, "error.resets_at").Int(); resetsAt > 0 {

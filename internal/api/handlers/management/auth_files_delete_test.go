@@ -127,3 +127,76 @@ func TestDeleteAuthFile_FallbackToAuthDirPath(t *testing.T) {
 		t.Fatalf("expected auth file to be removed from auth dir, stat err: %v", errStat)
 	}
 }
+
+func TestDeleteAuthFile_AllRespectsEnabledFilter(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	writeAuthFile := func(name string) string {
+		t.Helper()
+		path := filepath.Join(authDir, name)
+		if err := os.WriteFile(path, []byte(`{"type":"codex"}`), 0o600); err != nil {
+			t.Fatalf("failed to write auth file %s: %v", name, err)
+		}
+		return path
+	}
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	register := func(auth *coreauth.Auth) {
+		t.Helper()
+		if _, err := manager.Register(context.Background(), auth); err != nil {
+			t.Fatalf("register auth %s: %v", auth.ID, err)
+		}
+	}
+
+	register(&coreauth.Auth{
+		ID:       "enabled-auth",
+		FileName: "enabled.json",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"path": writeAuthFile("enabled.json"),
+		},
+		Metadata: map[string]any{"type": "codex"},
+	})
+	register(&coreauth.Auth{
+		ID:       "disabled-auth",
+		FileName: "disabled.json",
+		Provider: "codex",
+		Status:   coreauth.StatusDisabled,
+		Disabled: true,
+		Attributes: map[string]string{
+			"path": writeAuthFile("disabled.json"),
+		},
+		Metadata: map[string]any{"type": "codex"},
+	})
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = &memoryAuthStore{}
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodDelete, "/v0/management/auth-files?all=true&enabled=false", nil)
+
+	h.DeleteAuthFile(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected delete status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if got, ok := payload["deleted"].(float64); !ok || int(got) != 1 {
+		t.Fatalf("expected deleted=1, got %#v", payload["deleted"])
+	}
+
+	if _, err := os.Stat(filepath.Join(authDir, "disabled.json")); !os.IsNotExist(err) {
+		t.Fatalf("expected disabled auth file to be removed, stat err: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(authDir, "enabled.json")); err != nil {
+		t.Fatalf("expected enabled auth file to remain, stat err: %v", err)
+	}
+}

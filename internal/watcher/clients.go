@@ -202,6 +202,15 @@ func (w *Watcher) addOrUpdateClient(path string) {
 		}
 		w.lastAuthContents[normalized] = &newAuth
 	}
+	if w.authStoreSource != nil {
+		w.clientsMutex.Unlock()
+		if err := w.persistAuth(fmt.Sprintf("Sync auth %s", filepath.Base(path)), path); err != nil {
+			log.Errorf("failed to persist auth changes: %v", err)
+			return
+		}
+		w.refreshAuthState(false)
+		return
+	}
 
 	oldByID := make(map[string]*coreauth.Auth, len(w.fileAuthsByPath[normalized]))
 	for id, a := range w.fileAuthsByPath[normalized] {
@@ -239,6 +248,15 @@ func (w *Watcher) removeClient(path string) {
 	delete(w.lastAuthHashes, normalized)
 	delete(w.lastAuthContents, normalized)
 	delete(w.fileAuthsByPath, normalized)
+	if w.authStoreSource != nil {
+		w.clientsMutex.Unlock()
+		if err := w.persistAuth(fmt.Sprintf("Remove auth %s", filepath.Base(path)), path); err != nil {
+			log.Errorf("failed to persist auth changes: %v", err)
+			return
+		}
+		w.refreshAuthState(false)
+		return
+	}
 
 	updates := w.computePerPathUpdatesLocked(oldByID, map[string]*coreauth.Auth{})
 	w.clientsMutex.Unlock()
@@ -368,26 +386,42 @@ func (w *Watcher) persistConfigAsync() {
 	}()
 }
 
+func (w *Watcher) persistAuth(message string, paths ...string) error {
+	if w == nil || w.storePersister == nil {
+		return nil
+	}
+	filtered := filterPersistPaths(paths...)
+	if len(filtered) == 0 {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return w.storePersister.PersistAuthFiles(ctx, message, filtered...)
+}
+
 func (w *Watcher) persistAuthAsync(message string, paths ...string) {
 	if w == nil || w.storePersister == nil {
 		return
 	}
+	filtered := filterPersistPaths(paths...)
+	if len(filtered) == 0 {
+		return
+	}
+	go func() {
+		if err := w.persistAuth(message, filtered...); err != nil {
+			log.Errorf("failed to persist auth changes: %v", err)
+		}
+	}()
+}
+
+func filterPersistPaths(paths ...string) []string {
 	filtered := make([]string, 0, len(paths))
 	for _, p := range paths {
 		if trimmed := strings.TrimSpace(p); trimmed != "" {
 			filtered = append(filtered, trimmed)
 		}
 	}
-	if len(filtered) == 0 {
-		return
-	}
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := w.storePersister.PersistAuthFiles(ctx, message, filtered...); err != nil {
-			log.Errorf("failed to persist auth changes: %v", err)
-		}
-	}()
+	return filtered
 }
 
 func (w *Watcher) stopServerUpdateTimer() {

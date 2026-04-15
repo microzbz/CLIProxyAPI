@@ -219,6 +219,22 @@ func TestConvertOpenAIResponsesRequestToCodex_OriginalIssue(t *testing.T) {
 	}
 }
 
+func TestConvertOpenAIResponsesRequestToCodex_NormalizesMinimalReasoningEffortToLow(t *testing.T) {
+	inputJSON := []byte(`{
+		"model": "gpt-5.4",
+		"input": "hello",
+		"reasoning": {
+			"effort": "minimal"
+		}
+	}`)
+
+	output := ConvertOpenAIResponsesRequestToCodex("gpt-5.4", inputJSON, false)
+
+	if got := gjson.GetBytes(output, "reasoning.effort").String(); got != "low" {
+		t.Fatalf("reasoning.effort = %q, want %q: %s", got, "low", string(output))
+	}
+}
+
 // TestConvertSystemRoleToDeveloper_AssistantRole tests that assistant role is preserved
 func TestConvertSystemRoleToDeveloper_AssistantRole(t *testing.T) {
 	inputJSON := []byte(`{

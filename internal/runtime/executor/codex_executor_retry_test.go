@@ -47,8 +47,12 @@ func TestParseCodexRetryAfter(t *testing.T) {
 
 	t.Run("non-429 status code", func(t *testing.T) {
 		body := []byte(`{"error":{"type":"usage_limit_reached","resets_in_seconds":30}}`)
-		if got := parseCodexRetryAfter(http.StatusBadRequest, body, now); got != nil {
-			t.Fatalf("expected nil for non-429, got %v", *got)
+		got := parseCodexRetryAfter(http.StatusBadRequest, body, now)
+		if got == nil {
+			t.Fatalf("expected retryAfter for usage_limit_reached, got nil")
+		}
+		if *got != 30*time.Second {
+			t.Fatalf("retryAfter = %v, want %v", *got, 30*time.Second)
 		}
 	})
 
@@ -70,6 +74,20 @@ func TestNewCodexStatusErrTreatsCapacityAsRetryableRateLimit(t *testing.T) {
 	}
 	if err.RetryAfter() != nil {
 		t.Fatalf("expected nil explicit retryAfter for capacity fallback, got %v", *err.RetryAfter())
+	}
+}
+
+func TestNewCodexStatusErrTreatsUsageLimitReachedAsRetryableRateLimit(t *testing.T) {
+	resetAt := time.Now().Add(3 * time.Minute).Unix()
+	body := []byte(`{"error":{"type":"usage_limit_reached","message":"The usage limit has been reached","resets_at":` + itoa(resetAt) + `}}`)
+
+	err := newCodexStatusErr(http.StatusUnauthorized, body)
+
+	if got := err.StatusCode(); got != http.StatusTooManyRequests {
+		t.Fatalf("status code = %d, want %d", got, http.StatusTooManyRequests)
+	}
+	if err.RetryAfter() == nil {
+		t.Fatalf("expected retryAfter, got nil")
 	}
 }
 

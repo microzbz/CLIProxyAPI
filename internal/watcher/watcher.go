@@ -28,6 +28,15 @@ type authDirProvider interface {
 	AuthDir() string
 }
 
+type authStoreSource interface {
+	List(context.Context) ([]*coreauth.Auth, error)
+}
+
+type authoritativeAuthStore interface {
+	authStoreSource
+	UseStoreAuthSource() bool
+}
+
 // Watcher manages file watching for configuration and authentication files
 type Watcher struct {
 	configPath        string
@@ -57,6 +66,7 @@ type Watcher struct {
 	pendingOrder      []string
 	dispatchCancel    context.CancelFunc
 	storePersister    storePersister
+	authStoreSource   authStoreSource
 	mirroredAuthDir   string
 	oldConfigYaml     []byte
 }
@@ -106,6 +116,10 @@ func NewWatcher(configPath, authDir string, reloadCallback func(*config.Config))
 			w.storePersister = persister
 			log.Debug("persistence-capable token store detected; watcher will propagate persisted changes")
 		}
+		if source, ok := store.(authoritativeAuthStore); ok && source.UseStoreAuthSource() {
+			w.authStoreSource = source
+			log.Debug("authoritative auth store detected; watcher will source auth-file state from the store")
+		}
 		if provider, ok := store.(authDirProvider); ok {
 			if fixed := strings.TrimSpace(provider.AuthDir()); fixed != "" {
 				w.mirroredAuthDir = fixed
@@ -154,6 +168,7 @@ func (w *Watcher) DispatchRuntimeAuthUpdate(update AuthUpdate) bool {
 func (w *Watcher) SnapshotCoreAuths() []*coreauth.Auth {
 	w.clientsMutex.RLock()
 	cfg := w.config
+	authDir := w.authDir
 	w.clientsMutex.RUnlock()
-	return snapshotCoreAuths(cfg, w.authDir)
+	return w.snapshotAuthoritativeAuths(cfg, authDir)
 }

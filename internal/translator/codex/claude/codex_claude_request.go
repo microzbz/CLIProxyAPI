@@ -296,7 +296,7 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 			// Pass through directly; ApplyThinking handles clamping to target model's levels.
 			effort := ""
 			if v := rootResult.Get("output_config.effort"); v.Exists() && v.Type == gjson.String {
-				effort = strings.ToLower(strings.TrimSpace(v.String()))
+				effort = thinking.NormalizeOpenAIEffort(v.String())
 			}
 			if effort != "" {
 				reasoningEffort = effort
@@ -305,11 +305,11 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool) 
 			}
 		case "disabled":
 			if effort, ok := thinking.ConvertBudgetToLevel(0); ok && effort != "" {
-				reasoningEffort = effort
+				reasoningEffort = thinking.NormalizeOpenAIEffort(effort)
 			}
 		}
 	}
-	template, _ = sjson.SetBytes(template, "reasoning.effort", reasoningEffort)
+	template, _ = sjson.SetBytes(template, "reasoning.effort", thinking.NormalizeOpenAIEffort(reasoningEffort))
 	template, _ = sjson.SetBytes(template, "reasoning.summary", "auto")
 	template, _ = sjson.SetBytes(template, "stream", true)
 	template, _ = sjson.SetBytes(template, "store", false)

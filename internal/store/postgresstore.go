@@ -15,34 +15,42 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
 
 const (
-	defaultConfigTable = "config_store"
-	defaultAuthTable   = "auth_store"
-	defaultConfigKey   = "config"
+	defaultConfigTable   = "config_store"
+	defaultAuthTable     = "auth_store"
+	defaultSettingsTable = "settings_store"
+	defaultUsageTable    = "usage_store"
+	defaultConfigKey     = "config"
+	usageRetentionKey    = "usage_retention_days"
 )
 
 // PostgresStoreConfig captures configuration required to initialize a Postgres-backed store.
 type PostgresStoreConfig struct {
-	DSN         string
-	Schema      string
-	ConfigTable string
-	AuthTable   string
-	SpoolDir    string
+	DSN           string
+	Schema        string
+	ConfigTable   string
+	AuthTable     string
+	SettingsTable string
+	UsageTable    string
+	SpoolDir      string
 }
 
 // PostgresStore persists configuration and authentication metadata using PostgreSQL as backend
 // while mirroring data to a local workspace so existing file-based workflows continue to operate.
 type PostgresStore struct {
-	db         *sql.DB
-	cfg        PostgresStoreConfig
-	spoolRoot  string
-	configPath string
-	authDir    string
-	mu         sync.Mutex
+	db               *sql.DB
+	cfg              PostgresStoreConfig
+	spoolRoot        string
+	configPath       string
+	authDir          string
+	mu               sync.Mutex
+	usageCleanupMu   sync.Mutex
+	lastUsageCleanup time.Time
 }
 
 // NewPostgresStore establishes a connection to PostgreSQL and prepares the local workspace.
@@ -57,6 +65,12 @@ func NewPostgresStore(ctx context.Context, cfg PostgresStoreConfig) (*PostgresSt
 	}
 	if cfg.AuthTable == "" {
 		cfg.AuthTable = defaultAuthTable
+	}
+	if cfg.SettingsTable == "" {
+		cfg.SettingsTable = defaultSettingsTable
+	}
+	if cfg.UsageTable == "" {
+		cfg.UsageTable = defaultUsageTable
 	}
 
 	spoolRoot := strings.TrimSpace(cfg.SpoolDir)
@@ -140,15 +154,71 @@ func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 	`, authTable)); err != nil {
 		return fmt.Errorf("postgres store: create auth table: %w", err)
 	}
+	settingsTable := s.fullTableName(s.cfg.SettingsTable)
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS %s (
+			key TEXT PRIMARY KEY,
+			value TEXT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)
+	`, settingsTable)); err != nil {
+		return fmt.Errorf("postgres store: create settings table: %w", err)
+	}
+	usageTable := s.fullTableName(s.cfg.UsageTable)
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS %s (
+			id BIGSERIAL PRIMARY KEY,
+			dedup_key TEXT NOT NULL UNIQUE,
+			api_name TEXT NOT NULL,
+			provider TEXT NOT NULL,
+			model TEXT NOT NULL,
+			auth_id TEXT NOT NULL DEFAULT '',
+			auth_index TEXT NOT NULL DEFAULT '',
+			source TEXT NOT NULL DEFAULT '',
+			requested_at TIMESTAMPTZ NOT NULL,
+			latency_ms BIGINT NOT NULL DEFAULT 0,
+			failed BOOLEAN NOT NULL DEFAULT FALSE,
+			input_tokens BIGINT NOT NULL DEFAULT 0,
+			output_tokens BIGINT NOT NULL DEFAULT 0,
+			reasoning_tokens BIGINT NOT NULL DEFAULT 0,
+			cached_tokens BIGINT NOT NULL DEFAULT 0,
+			total_tokens BIGINT NOT NULL DEFAULT 0,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)
+	`, usageTable)); err != nil {
+		return fmt.Errorf("postgres store: create usage table: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON %s (requested_at DESC)`, quoteIdentifier(s.cfg.UsageTable+"_requested_at_idx"), usageTable)); err != nil {
+		return fmt.Errorf("postgres store: create usage requested_at index: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s ON %s (api_name, model)`, quoteIdentifier(s.cfg.UsageTable+"_api_model_idx"), usageTable)); err != nil {
+		return fmt.Errorf("postgres store: create usage api/model index: %w", err)
+	}
+	if err := s.ensureDefaultUsageRetention(ctx); err != nil {
+		return err
+	}
 	return nil
 }
 
-// Bootstrap synchronizes configuration and auth records between PostgreSQL and the local workspace.
-func (s *PostgresStore) Bootstrap(ctx context.Context, exampleConfigPath string) error {
-	if err := s.EnsureSchema(ctx); err != nil {
-		return err
+func (s *PostgresStore) ensureDefaultUsageRetention(ctx context.Context) error {
+	days := usage.DefaultRetentionDays
+	query := fmt.Sprintf(`
+		INSERT INTO %s (key, value, created_at, updated_at)
+		VALUES ($1, $2, NOW(), NOW())
+		ON CONFLICT (key) DO NOTHING
+	`, s.fullTableName(s.cfg.SettingsTable))
+	if _, err := s.db.ExecContext(ctx, query, usageRetentionKey, fmt.Sprintf("%d", days)); err != nil {
+		return fmt.Errorf("postgres store: seed usage retention setting: %w", err)
 	}
-	if err := s.syncConfigFromDatabase(ctx, exampleConfigPath); err != nil {
+	return nil
+}
+
+// Bootstrap synchronizes auth records between PostgreSQL and the local workspace.
+// Configuration is intentionally file-only and is no longer loaded from or persisted to PostgreSQL.
+func (s *PostgresStore) Bootstrap(ctx context.Context, exampleConfigPath string) error {
+	_ = exampleConfigPath
+	if err := s.EnsureSchema(ctx); err != nil {
 		return err
 	}
 	if err := s.syncAuthFromDatabase(ctx); err != nil {
@@ -171,6 +241,11 @@ func (s *PostgresStore) AuthDir() string {
 		return ""
 	}
 	return s.authDir
+}
+
+// UseStoreAuthSource marks PostgreSQL as the authoritative source for auth-file state.
+func (s *PostgresStore) UseStoreAuthSource() bool {
+	return s != nil
 }
 
 // WorkDir exposes the root spool directory used for mirroring.
@@ -212,29 +287,46 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 		return "", fmt.Errorf("postgres store: create auth directory: %w", err)
 	}
 
+	type metadataSetter interface {
+		SetMetadata(map[string]any)
+	}
+
+	var metadataPayload []byte
 	switch {
 	case auth.Storage != nil:
+		if setter, ok := auth.Storage.(metadataSetter); ok {
+			setter.SetMetadata(auth.Metadata)
+		}
 		if err = auth.Storage.SaveTokenToFile(path); err != nil {
 			return "", err
 		}
+		metadataPayload, err = os.ReadFile(path)
+		if err != nil {
+			return "", fmt.Errorf("postgres store: read persisted auth file: %w", err)
+		}
 	case auth.Metadata != nil:
+		auth.Metadata["disabled"] = auth.Disabled
 		raw, errMarshal := json.Marshal(auth.Metadata)
 		if errMarshal != nil {
 			return "", fmt.Errorf("postgres store: marshal metadata: %w", errMarshal)
 		}
+		metadataPayload = raw
+		shouldWrite := true
 		if existing, errRead := os.ReadFile(path); errRead == nil {
 			if jsonEqual(existing, raw) {
-				return path, nil
+				shouldWrite = false
 			}
 		} else if errRead != nil && !errors.Is(errRead, fs.ErrNotExist) {
 			return "", fmt.Errorf("postgres store: read existing metadata: %w", errRead)
 		}
-		tmp := path + ".tmp"
-		if errWrite := os.WriteFile(tmp, raw, 0o600); errWrite != nil {
-			return "", fmt.Errorf("postgres store: write temp auth file: %w", errWrite)
-		}
-		if errRename := os.Rename(tmp, path); errRename != nil {
-			return "", fmt.Errorf("postgres store: rename auth file: %w", errRename)
+		if shouldWrite {
+			tmp := path + ".tmp"
+			if errWrite := os.WriteFile(tmp, raw, 0o600); errWrite != nil {
+				return "", fmt.Errorf("postgres store: write temp auth file: %w", errWrite)
+			}
+			if errRename := os.Rename(tmp, path); errRename != nil {
+				return "", fmt.Errorf("postgres store: rename auth file: %w", errRename)
+			}
 		}
 	default:
 		return "", fmt.Errorf("postgres store: nothing to persist for %s", auth.ID)
@@ -253,7 +345,7 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 	if err != nil {
 		return "", err
 	}
-	if err = s.upsertAuthRecord(ctx, relID, path); err != nil {
+	if err = s.upsertAuthRecord(ctx, relID, path, auth, metadataPayload); err != nil {
 		return "", err
 	}
 	return path, nil
@@ -284,31 +376,10 @@ func (s *PostgresStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) 
 			log.WithError(errPath).Warnf("postgres store: skipping auth %s outside spool", id)
 			continue
 		}
-		metadata := make(map[string]any)
-		if err = json.Unmarshal([]byte(payload), &metadata); err != nil {
-			log.WithError(err).Warnf("postgres store: skipping auth %s with invalid json", id)
+		auth, _, errDecode := decodePersistedAuthPayload(id, []byte(payload), createdAt, updatedAt, path)
+		if errDecode != nil {
+			log.WithError(errDecode).Warnf("postgres store: skipping auth %s with invalid json", id)
 			continue
-		}
-		provider := strings.TrimSpace(valueAsString(metadata["type"]))
-		if provider == "" {
-			provider = "unknown"
-		}
-		attr := map[string]string{"path": path}
-		if email := strings.TrimSpace(valueAsString(metadata["email"])); email != "" {
-			attr["email"] = email
-		}
-		auth := &cliproxyauth.Auth{
-			ID:               normalizeAuthID(id),
-			Provider:         provider,
-			FileName:         normalizeAuthID(id),
-			Label:            labelFor(metadata),
-			Status:           cliproxyauth.StatusActive,
-			Attributes:       attr,
-			Metadata:         metadata,
-			CreatedAt:        createdAt,
-			UpdatedAt:        updatedAt,
-			LastRefreshedAt:  time.Time{},
-			NextRefreshAfter: time.Time{},
 		}
 		auths = append(auths, auth)
 	}
@@ -376,19 +447,11 @@ func (s *PostgresStore) PersistAuthFiles(ctx context.Context, _ string, paths ..
 	return nil
 }
 
-// PersistConfig mirrors the local configuration file to PostgreSQL.
+// PersistConfig is intentionally a no-op: configuration now stays file-backed even when
+// PostgreSQL is enabled for auth mirroring and usage persistence.
 func (s *PostgresStore) PersistConfig(ctx context.Context) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	data, err := os.ReadFile(s.configPath)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return s.deleteConfigRecord(ctx)
-		}
-		return fmt.Errorf("postgres store: read config file: %w", err)
-	}
-	return s.persistConfig(ctx, data)
+	_ = ctx
+	return nil
 }
 
 // syncConfigFromDatabase writes the database-stored config to disk or seeds the database from template.
@@ -462,10 +525,14 @@ func (s *PostgresStore) syncAuthFromDatabase(ctx context.Context) error {
 			log.WithError(errPath).Warnf("postgres store: skipping auth %s outside spool", id)
 			continue
 		}
+		_, metadataPayload, errDecode := decodePersistedAuthPayload(id, []byte(payload), time.Time{}, time.Time{}, path)
+		if errDecode != nil {
+			return fmt.Errorf("postgres store: decode auth %s: %w", id, errDecode)
+		}
 		if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			return fmt.Errorf("postgres store: create auth subdir: %w", err)
 		}
-		if err = os.WriteFile(path, []byte(payload), 0o600); err != nil {
+		if err = os.WriteFile(path, metadataPayload, 0o600); err != nil {
 			return fmt.Errorf("postgres store: write auth file: %w", err)
 		}
 	}
@@ -486,29 +553,35 @@ func (s *PostgresStore) syncAuthFile(ctx context.Context, relID, path string) er
 	if len(data) == 0 {
 		return s.deleteAuthRecord(ctx, relID)
 	}
-	return s.persistAuth(ctx, relID, data)
+	return s.persistAuth(ctx, relID, data, nil)
 }
 
-func (s *PostgresStore) upsertAuthRecord(ctx context.Context, relID, path string) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return fmt.Errorf("postgres store: read auth file: %w", err)
+func (s *PostgresStore) upsertAuthRecord(ctx context.Context, relID, path string, auth *cliproxyauth.Auth, data []byte) error {
+	var err error
+	if len(data) == 0 {
+		data, err = os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("postgres store: read auth file: %w", err)
+		}
 	}
 	if len(data) == 0 {
 		return s.deleteAuthRecord(ctx, relID)
 	}
-	return s.persistAuth(ctx, relID, data)
+	return s.persistAuth(ctx, relID, data, auth)
 }
 
-func (s *PostgresStore) persistAuth(ctx context.Context, relID string, data []byte) error {
-	jsonPayload := json.RawMessage(data)
+func (s *PostgresStore) persistAuth(ctx context.Context, relID string, data []byte, auth *cliproxyauth.Auth) error {
+	jsonPayload, err := s.buildPersistedAuthPayload(ctx, relID, data, auth)
+	if err != nil {
+		return err
+	}
 	query := fmt.Sprintf(`
 		INSERT INTO %s (id, content, created_at, updated_at)
 		VALUES ($1, $2, NOW(), NOW())
 		ON CONFLICT (id)
 		DO UPDATE SET content = EXCLUDED.content, updated_at = NOW()
 	`, s.fullTableName(s.cfg.AuthTable))
-	if _, err := s.db.ExecContext(ctx, query, relID, jsonPayload); err != nil {
+	if _, err := s.db.ExecContext(ctx, query, relID, json.RawMessage(jsonPayload)); err != nil {
 		return fmt.Errorf("postgres store: upsert auth record: %w", err)
 	}
 	return nil
@@ -542,6 +615,394 @@ func (s *PostgresStore) deleteConfigRecord(ctx context.Context) error {
 		return fmt.Errorf("postgres store: delete config: %w", err)
 	}
 	return nil
+}
+
+// SaveUsageRecord persists one usage event and opportunistically prunes expired rows.
+func (s *PostgresStore) SaveUsageRecord(ctx context.Context, record usage.PersistentRecord) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("postgres store: not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	record.Tokens = normalizeUsageTokens(record.Tokens)
+	record.RequestedAt = normalizeUsageTimestamp(record.RequestedAt)
+	record.Model = normalizeUsageString(record.Model, "unknown")
+	record.Provider = normalizeUsageString(record.Provider, "unknown")
+	record.APIName = normalizeUsageString(record.APIName, "unknown")
+	record.Source = strings.TrimSpace(record.Source)
+	record.AuthID = strings.TrimSpace(record.AuthID)
+	record.AuthIndex = strings.TrimSpace(record.AuthIndex)
+	if record.LatencyMs < 0 {
+		record.LatencyMs = 0
+	}
+
+	if err := s.maybeCleanupUsageRecords(ctx); err != nil {
+		log.WithError(err).Warn("postgres store: usage cleanup failed")
+	}
+
+	query := fmt.Sprintf(`
+		INSERT INTO %s (
+			dedup_key, api_name, provider, model, auth_id, auth_index, source,
+			requested_at, latency_ms, failed,
+			input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens, created_at
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW())
+		ON CONFLICT (dedup_key) DO NOTHING
+	`, s.fullTableName(s.cfg.UsageTable))
+	if _, err := s.db.ExecContext(
+		ctx,
+		query,
+		usage.PersistentDedupKey(record),
+		record.APIName,
+		record.Provider,
+		record.Model,
+		record.AuthID,
+		record.AuthIndex,
+		record.Source,
+		record.RequestedAt.UTC(),
+		record.LatencyMs,
+		record.Failed,
+		record.Tokens.InputTokens,
+		record.Tokens.OutputTokens,
+		record.Tokens.ReasoningTokens,
+		record.Tokens.CachedTokens,
+		record.Tokens.TotalTokens,
+	); err != nil {
+		return fmt.Errorf("postgres store: insert usage record: %w", err)
+	}
+	return nil
+}
+
+// LoadUsageSnapshot aggregates retained usage rows into the management snapshot shape.
+func (s *PostgresStore) LoadUsageSnapshot(ctx context.Context) (usage.StatisticsSnapshot, error) {
+	if s == nil || s.db == nil {
+		return usage.StatisticsSnapshot{}, fmt.Errorf("postgres store: not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := s.maybeCleanupUsageRecords(ctx); err != nil {
+		log.WithError(err).Warn("postgres store: usage cleanup failed")
+	}
+	retentionDays, err := s.GetUsageRetentionDays(ctx)
+	if err != nil {
+		return usage.StatisticsSnapshot{}, err
+	}
+	cutoff := time.Now().UTC().AddDate(0, 0, -usage.NormalizeRetentionDays(retentionDays))
+	query := fmt.Sprintf(`
+		SELECT api_name, model, requested_at, latency_ms, source, auth_index, failed,
+		       input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens
+		FROM %s
+		WHERE requested_at >= $1
+		ORDER BY requested_at ASC
+	`, s.fullTableName(s.cfg.UsageTable))
+	rows, err := s.db.QueryContext(ctx, query, cutoff)
+	if err != nil {
+		return usage.StatisticsSnapshot{}, fmt.Errorf("postgres store: query usage rows: %w", err)
+	}
+	defer rows.Close()
+
+	snapshot := usage.StatisticsSnapshot{
+		APIs:           make(map[string]usage.APISnapshot),
+		RequestsByDay:  make(map[string]int64),
+		RequestsByHour: make(map[string]int64),
+		TokensByDay:    make(map[string]int64),
+		TokensByHour:   make(map[string]int64),
+	}
+	for rows.Next() {
+		var (
+			apiName         string
+			modelName       string
+			requestedAt     time.Time
+			latencyMs       int64
+			source          string
+			authIndex       string
+			failed          bool
+			inputTokens     int64
+			outputTokens    int64
+			reasoningTokens int64
+			cachedTokens    int64
+			totalTokens     int64
+		)
+		if err := rows.Scan(
+			&apiName,
+			&modelName,
+			&requestedAt,
+			&latencyMs,
+			&source,
+			&authIndex,
+			&failed,
+			&inputTokens,
+			&outputTokens,
+			&reasoningTokens,
+			&cachedTokens,
+			&totalTokens,
+		); err != nil {
+			return usage.StatisticsSnapshot{}, fmt.Errorf("postgres store: scan usage row: %w", err)
+		}
+		detail := usage.RequestDetail{
+			Timestamp: requestedAt.UTC(),
+			LatencyMs: latencyMs,
+			Source:    source,
+			AuthIndex: authIndex,
+			Failed:    failed,
+			Tokens: usage.TokenStats{
+				InputTokens:     inputTokens,
+				OutputTokens:    outputTokens,
+				ReasoningTokens: reasoningTokens,
+				CachedTokens:    cachedTokens,
+				TotalTokens:     totalTokens,
+			},
+		}
+		snapshot = appendUsageSnapshotRow(snapshot, apiName, modelName, detail)
+	}
+	if err := rows.Err(); err != nil {
+		return usage.StatisticsSnapshot{}, fmt.Errorf("postgres store: iterate usage rows: %w", err)
+	}
+	return snapshot, nil
+}
+
+// MergeUsageSnapshot imports exported usage details into PostgreSQL while deduplicating.
+func (s *PostgresStore) MergeUsageSnapshot(ctx context.Context, snapshot usage.StatisticsSnapshot) (usage.MergeResult, error) {
+	if s == nil || s.db == nil {
+		return usage.MergeResult{}, fmt.Errorf("postgres store: not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := s.maybeCleanupUsageRecords(ctx); err != nil {
+		log.WithError(err).Warn("postgres store: usage cleanup failed")
+	}
+	retentionDays, err := s.GetUsageRetentionDays(ctx)
+	if err != nil {
+		return usage.MergeResult{}, err
+	}
+	cutoff := time.Now().UTC().AddDate(0, 0, -usage.NormalizeRetentionDays(retentionDays))
+	query := fmt.Sprintf(`
+		INSERT INTO %s (
+			dedup_key, api_name, provider, model, auth_id, auth_index, source,
+			requested_at, latency_ms, failed,
+			input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens, created_at
+		)
+		VALUES ($1, $2, '', $3, '', $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, NOW())
+		ON CONFLICT (dedup_key) DO NOTHING
+	`, s.fullTableName(s.cfg.UsageTable))
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return usage.MergeResult{}, fmt.Errorf("postgres store: begin usage import tx: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback()
+	}()
+	stmt, err := tx.PrepareContext(ctx, query)
+	if err != nil {
+		return usage.MergeResult{}, fmt.Errorf("postgres store: prepare usage import: %w", err)
+	}
+	defer stmt.Close()
+
+	result := usage.MergeResult{}
+	for apiName, apiSnapshot := range snapshot.APIs {
+		apiName = normalizeUsageString(apiName, "unknown")
+		for modelName, modelSnapshot := range apiSnapshot.Models {
+			modelName = normalizeUsageString(modelName, "unknown")
+			for _, detail := range modelSnapshot.Details {
+				detail.Tokens = normalizeUsageTokens(detail.Tokens)
+				detail.Timestamp = normalizeUsageTimestamp(detail.Timestamp)
+				if detail.Timestamp.Before(cutoff) {
+					result.Skipped++
+					continue
+				}
+				record := usage.PersistentRecord{
+					APIName:     apiName,
+					Model:       modelName,
+					AuthIndex:   strings.TrimSpace(detail.AuthIndex),
+					Source:      strings.TrimSpace(detail.Source),
+					RequestedAt: detail.Timestamp.UTC(),
+					LatencyMs:   detail.LatencyMs,
+					Failed:      detail.Failed,
+					Tokens:      detail.Tokens,
+				}
+				res, errExec := stmt.ExecContext(
+					ctx,
+					usage.PersistentDedupKey(record),
+					record.APIName,
+					record.Model,
+					record.AuthIndex,
+					record.Source,
+					record.RequestedAt,
+					record.LatencyMs,
+					record.Failed,
+					record.Tokens.InputTokens,
+					record.Tokens.OutputTokens,
+					record.Tokens.ReasoningTokens,
+					record.Tokens.CachedTokens,
+					record.Tokens.TotalTokens,
+				)
+				if errExec != nil {
+					return usage.MergeResult{}, fmt.Errorf("postgres store: import usage row: %w", errExec)
+				}
+				affected, _ := res.RowsAffected()
+				if affected > 0 {
+					result.Added += affected
+				} else {
+					result.Skipped++
+				}
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return usage.MergeResult{}, fmt.Errorf("postgres store: commit usage import: %w", err)
+	}
+	return result, nil
+}
+
+// GetUsageRetentionDays returns the retained usage window.
+func (s *PostgresStore) GetUsageRetentionDays(ctx context.Context) (int, error) {
+	if s == nil || s.db == nil {
+		return usage.DefaultRetentionDays, fmt.Errorf("postgres store: not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := s.ensureDefaultUsageRetention(ctx); err != nil {
+		return usage.DefaultRetentionDays, err
+	}
+	query := fmt.Sprintf("SELECT value FROM %s WHERE key = $1", s.fullTableName(s.cfg.SettingsTable))
+	var raw string
+	if err := s.db.QueryRowContext(ctx, query, usageRetentionKey).Scan(&raw); err != nil {
+		return usage.DefaultRetentionDays, fmt.Errorf("postgres store: load usage retention: %w", err)
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return usage.DefaultRetentionDays, nil
+	}
+	var days int
+	if _, err := fmt.Sscanf(raw, "%d", &days); err != nil {
+		return usage.DefaultRetentionDays, nil
+	}
+	return usage.NormalizeRetentionDays(days), nil
+}
+
+// SetUsageRetentionDays updates the retained usage window.
+func (s *PostgresStore) SetUsageRetentionDays(ctx context.Context, days int) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("postgres store: not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	days = usage.NormalizeRetentionDays(days)
+	query := fmt.Sprintf(`
+		INSERT INTO %s (key, value, created_at, updated_at)
+		VALUES ($1, $2, NOW(), NOW())
+		ON CONFLICT (key)
+		DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+	`, s.fullTableName(s.cfg.SettingsTable))
+	if _, err := s.db.ExecContext(ctx, query, usageRetentionKey, fmt.Sprintf("%d", days)); err != nil {
+		return fmt.Errorf("postgres store: update usage retention: %w", err)
+	}
+	return s.cleanupUsageBefore(ctx, time.Now().UTC().AddDate(0, 0, -days))
+}
+
+func (s *PostgresStore) maybeCleanupUsageRecords(ctx context.Context) error {
+	s.usageCleanupMu.Lock()
+	defer s.usageCleanupMu.Unlock()
+	now := time.Now().UTC()
+	if !s.lastUsageCleanup.IsZero() && now.Sub(s.lastUsageCleanup) < time.Hour {
+		return nil
+	}
+	days, err := s.GetUsageRetentionDays(ctx)
+	if err != nil {
+		return err
+	}
+	if err := s.cleanupUsageBefore(ctx, now.AddDate(0, 0, -usage.NormalizeRetentionDays(days))); err != nil {
+		return err
+	}
+	s.lastUsageCleanup = now
+	return nil
+}
+
+func (s *PostgresStore) cleanupUsageBefore(ctx context.Context, cutoff time.Time) error {
+	query := fmt.Sprintf("DELETE FROM %s WHERE requested_at < $1", s.fullTableName(s.cfg.UsageTable))
+	if _, err := s.db.ExecContext(ctx, query, cutoff.UTC()); err != nil {
+		return fmt.Errorf("postgres store: delete expired usage rows: %w", err)
+	}
+	return nil
+}
+
+func appendUsageSnapshotRow(snapshot usage.StatisticsSnapshot, apiName, modelName string, detail usage.RequestDetail) usage.StatisticsSnapshot {
+	if snapshot.APIs == nil {
+		snapshot.APIs = make(map[string]usage.APISnapshot)
+	}
+	if snapshot.RequestsByDay == nil {
+		snapshot.RequestsByDay = make(map[string]int64)
+	}
+	if snapshot.RequestsByHour == nil {
+		snapshot.RequestsByHour = make(map[string]int64)
+	}
+	if snapshot.TokensByDay == nil {
+		snapshot.TokensByDay = make(map[string]int64)
+	}
+	if snapshot.TokensByHour == nil {
+		snapshot.TokensByHour = make(map[string]int64)
+	}
+
+	totalTokens := normalizeUsageTokens(detail.Tokens).TotalTokens
+	snapshot.TotalRequests++
+	if detail.Failed {
+		snapshot.FailureCount++
+	} else {
+		snapshot.SuccessCount++
+	}
+	snapshot.TotalTokens += totalTokens
+
+	apiSnapshot := snapshot.APIs[apiName]
+	if apiSnapshot.Models == nil {
+		apiSnapshot.Models = make(map[string]usage.ModelSnapshot)
+	}
+	apiSnapshot.TotalRequests++
+	apiSnapshot.TotalTokens += totalTokens
+
+	modelSnapshot := apiSnapshot.Models[modelName]
+	modelSnapshot.TotalRequests++
+	modelSnapshot.TotalTokens += totalTokens
+	modelSnapshot.Details = append(modelSnapshot.Details, detail)
+	apiSnapshot.Models[modelName] = modelSnapshot
+	snapshot.APIs[apiName] = apiSnapshot
+
+	dayKey := detail.Timestamp.Format("2006-01-02")
+	hourKey := fmt.Sprintf("%02d", detail.Timestamp.Hour())
+	snapshot.RequestsByDay[dayKey]++
+	snapshot.RequestsByHour[hourKey]++
+	snapshot.TokensByDay[dayKey] += totalTokens
+	snapshot.TokensByHour[hourKey] += totalTokens
+	return snapshot
+}
+
+func normalizeUsageTokens(tokens usage.TokenStats) usage.TokenStats {
+	if tokens.TotalTokens == 0 {
+		tokens.TotalTokens = tokens.InputTokens + tokens.OutputTokens + tokens.ReasoningTokens
+	}
+	if tokens.TotalTokens == 0 {
+		tokens.TotalTokens = tokens.InputTokens + tokens.OutputTokens + tokens.ReasoningTokens + tokens.CachedTokens
+	}
+	return tokens
+}
+
+func normalizeUsageTimestamp(ts time.Time) time.Time {
+	if ts.IsZero() {
+		return time.Now().UTC()
+	}
+	return ts.UTC()
+}
+
+func normalizeUsageString(value, fallback string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return fallback
+	}
+	return value
 }
 
 func (s *PostgresStore) resolveAuthPath(auth *cliproxyauth.Auth) (string, error) {

@@ -12,9 +12,14 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher/synthesizer"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	log "github.com/sirupsen/logrus"
 )
 
-var snapshotCoreAuthsFunc = snapshotCoreAuths
+var (
+	snapshotCoreAuthsFunc       = snapshotCoreAuths
+	snapshotConfigCoreAuthsFunc = snapshotConfigCoreAuths
+	snapshotFileCoreAuthsFunc   = snapshotFileCoreAuths
+)
 
 func (w *Watcher) setAuthUpdateQueue(queue chan<- AuthUpdate) {
 	w.clientsMutex.Lock()
@@ -82,7 +87,7 @@ func (w *Watcher) refreshAuthState(force bool) {
 	cfg := w.config
 	authDir := w.authDir
 	w.clientsMutex.RUnlock()
-	auths := snapshotCoreAuthsFunc(cfg, authDir)
+	auths := w.snapshotAuthoritativeAuths(cfg, authDir)
 	w.clientsMutex.Lock()
 	if len(w.runtimeAuths) > 0 {
 		for _, a := range w.runtimeAuths {
@@ -255,7 +260,41 @@ func normalizeAuth(a *coreauth.Auth) *coreauth.Auth {
 	return clone
 }
 
+func (w *Watcher) snapshotAuthoritativeAuths(cfg *config.Config, authDir string) []*coreauth.Auth {
+	auths := snapshotConfigCoreAuthsFunc(cfg, authDir)
+	if w == nil || w.authStoreSource == nil {
+		return append(auths, snapshotFileCoreAuthsFunc(cfg, authDir)...)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	storeAuths, err := w.authStoreSource.List(ctx)
+	if err != nil {
+		log.WithError(err).Warn("watcher: failed to list auths from authoritative store; falling back to auth directory snapshot")
+		return append(auths, snapshotFileCoreAuthsFunc(cfg, authDir)...)
+	}
+	return append(auths, cloneAuthSlice(storeAuths)...)
+}
+
+func cloneAuthSlice(auths []*coreauth.Auth) []*coreauth.Auth {
+	out := make([]*coreauth.Auth, 0, len(auths))
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		out = append(out, auth.Clone())
+	}
+	return out
+}
+
 func snapshotCoreAuths(cfg *config.Config, authDir string) []*coreauth.Auth {
+	out := snapshotConfigCoreAuths(cfg, authDir)
+	out = append(out, snapshotFileCoreAuths(cfg, authDir)...)
+	return out
+}
+
+func snapshotConfigCoreAuths(cfg *config.Config, authDir string) []*coreauth.Auth {
 	ctx := &synthesizer.SynthesisContext{
 		Config:      cfg,
 		AuthDir:     authDir,
@@ -269,11 +308,21 @@ func snapshotCoreAuths(cfg *config.Config, authDir string) []*coreauth.Auth {
 	if auths, err := configSynth.Synthesize(ctx); err == nil {
 		out = append(out, auths...)
 	}
+	return out
+}
 
+func snapshotFileCoreAuths(cfg *config.Config, authDir string) []*coreauth.Auth {
+	ctx := &synthesizer.SynthesisContext{
+		Config:      cfg,
+		AuthDir:     authDir,
+		Now:         time.Now(),
+		IDGenerator: synthesizer.NewStableIDGenerator(),
+	}
+
+	var out []*coreauth.Auth
 	fileSynth := synthesizer.NewFileSynthesizer()
 	if auths, err := fileSynth.Synthesize(ctx); err == nil {
 		out = append(out, auths...)
 	}
-
 	return out
 }

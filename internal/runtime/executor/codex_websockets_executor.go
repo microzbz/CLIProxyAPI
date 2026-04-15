@@ -931,15 +931,13 @@ func parseCodexWebsocketError(payload []byte) (error, bool) {
 	if len(payload) == 0 {
 		return nil, false
 	}
-	if strings.TrimSpace(gjson.GetBytes(payload, "type").String()) != "error" {
+	if strings.TrimSpace(gjson.GetBytes(payload, "type").String()) != "error" &&
+		!gjson.GetBytes(payload, "error").Exists() {
 		return nil, false
 	}
 	status := int(gjson.GetBytes(payload, "status").Int())
 	if status == 0 {
 		status = int(gjson.GetBytes(payload, "status_code").Int())
-	}
-	if status <= 0 {
-		return nil, false
 	}
 
 	out := []byte(`{}`)
@@ -953,10 +951,15 @@ func parseCodexWebsocketError(payload []byte) (error, bool) {
 		out, _ = sjson.SetBytes(out, "error.type", "server_error")
 		out, _ = sjson.SetBytes(out, "error.message", http.StatusText(status))
 	}
+	status = normalizeCodexErrorStatus(status, out)
+	if status <= 0 {
+		return nil, false
+	}
 
 	headers := parseCodexWebsocketErrorHeaders(payload)
+	retryAfter := parseCodexRetryAfter(status, out, time.Now())
 	return statusErrWithHeaders{
-		statusErr: statusErr{code: status, msg: string(out)},
+		statusErr: statusErr{code: status, msg: string(out), retryAfter: retryAfter},
 		headers:   headers,
 	}, true
 }

@@ -5,6 +5,7 @@ package middleware
 
 import (
 	"bytes"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -15,6 +16,12 @@ import (
 )
 
 const requestBodyOverrideContextKey = "REQUEST_BODY_OVERRIDE"
+
+const (
+	apiUpstreamResponseTimestampContextKey   = "API_UPSTREAM_RESPONSE_TIMESTAMP"
+	apiUpstreamFirstChunkTimestampContextKey = "API_UPSTREAM_FIRST_CHUNK_TIMESTAMP"
+	apiDownstreamFirstChunkTimestampContextKey = "API_DOWNSTREAM_FIRST_CHUNK_TIMESTAMP"
+)
 
 // RequestInfo holds essential details of an incoming HTTP request for logging purposes.
 type RequestInfo struct {
@@ -37,6 +44,7 @@ type ResponseWriterWrapper struct {
 	streamDone          chan struct{}              // streamDone signals when the streaming goroutine completes.
 	logger              logging.RequestLogger      // logger is the instance of the request logger service.
 	requestInfo         *RequestInfo               // requestInfo holds the details of the original request.
+	ginCtx              *gin.Context               // ginCtx provides access to per-request timing context.
 	statusCode          int                        // statusCode stores the HTTP status code of the response.
 	headers             map[string][]string        // headers stores the response headers.
 	logOnErrorOnly      bool                       // logOnErrorOnly enables logging only when an error response is detected.
@@ -53,12 +61,13 @@ type ResponseWriterWrapper struct {
 //
 // Returns:
 //   - A pointer to a new ResponseWriterWrapper.
-func NewResponseWriterWrapper(w gin.ResponseWriter, logger logging.RequestLogger, requestInfo *RequestInfo) *ResponseWriterWrapper {
+func NewResponseWriterWrapper(w gin.ResponseWriter, logger logging.RequestLogger, requestInfo *RequestInfo, ginCtx *gin.Context) *ResponseWriterWrapper {
 	return &ResponseWriterWrapper{
 		ResponseWriter: w,
 		body:           &bytes.Buffer{},
 		logger:         logger,
 		requestInfo:    requestInfo,
+		ginCtx:         ginCtx,
 		headers:        make(map[string][]string),
 	}
 }
@@ -81,6 +90,7 @@ func (w *ResponseWriterWrapper) Write(data []byte) (int, error) {
 		// Capture TTFB on first chunk (synchronous, before async channel send)
 		if w.firstChunkTimestamp.IsZero() {
 			w.firstChunkTimestamp = time.Now()
+			w.recordDownstreamFirstChunkTimestamp(w.firstChunkTimestamp)
 		}
 		// For streaming responses: Send to async logging channel (non-blocking)
 		select {
@@ -129,6 +139,7 @@ func (w *ResponseWriterWrapper) WriteString(data string) (int, error) {
 		// Capture TTFB on first chunk (synchronous, before async channel send)
 		if w.firstChunkTimestamp.IsZero() {
 			w.firstChunkTimestamp = time.Now()
+			w.recordDownstreamFirstChunkTimestamp(w.firstChunkTimestamp)
 		}
 		select {
 		case w.chunkChannel <- []byte(data):
@@ -349,7 +360,7 @@ func (w *ResponseWriterWrapper) extractAPIResponse(c *gin.Context) []byte {
 	if !ok || len(data) == 0 {
 		return nil
 	}
-	return data
+	return w.withAPITiming(data, c)
 }
 
 func (w *ResponseWriterWrapper) extractAPIResponseTimestamp(c *gin.Context) time.Time {
@@ -361,6 +372,99 @@ func (w *ResponseWriterWrapper) extractAPIResponseTimestamp(c *gin.Context) time
 		return t
 	}
 	return time.Time{}
+}
+
+func (w *ResponseWriterWrapper) recordDownstreamFirstChunkTimestamp(timestamp time.Time) {
+	if w == nil || w.ginCtx == nil || timestamp.IsZero() {
+		return
+	}
+	if _, exists := w.ginCtx.Get(apiDownstreamFirstChunkTimestampContextKey); exists {
+		return
+	}
+	w.ginCtx.Set(apiDownstreamFirstChunkTimestampContextKey, timestamp)
+}
+
+func (w *ResponseWriterWrapper) withAPITiming(data []byte, c *gin.Context) []byte {
+	if len(data) == 0 || c == nil {
+		return data
+	}
+	if bytes.Contains(data, []byte("=== API TIMING ===")) {
+		return data
+	}
+
+	requestStartedAt := time.Time{}
+	if w != nil && w.requestInfo != nil {
+		requestStartedAt = w.requestInfo.Timestamp
+	}
+	upstreamResponseAt := lookupTimestamp(c, apiUpstreamResponseTimestampContextKey)
+	upstreamFirstChunkAt := lookupTimestamp(c, apiUpstreamFirstChunkTimestampContextKey)
+	downstreamFirstChunkAt := lookupTimestamp(c, apiDownstreamFirstChunkTimestampContextKey)
+
+	if requestStartedAt.IsZero() && upstreamResponseAt.IsZero() && upstreamFirstChunkAt.IsZero() && downstreamFirstChunkAt.IsZero() {
+		return data
+	}
+
+	var timing strings.Builder
+	timing.WriteString("\n=== API TIMING ===\n")
+	appendTimestampLine(&timing, "Request Started At", requestStartedAt)
+	appendTimestampLine(&timing, "Upstream HTTP Response At", upstreamResponseAt)
+	appendTimestampLine(&timing, "Upstream First Chunk At", upstreamFirstChunkAt)
+	appendTimestampLine(&timing, "Downstream First Forwarded Chunk At", downstreamFirstChunkAt)
+	appendDurationLine(&timing, "Request -> Upstream HTTP Response", requestStartedAt, upstreamResponseAt)
+	appendDurationLine(&timing, "Request -> Upstream First Chunk", requestStartedAt, upstreamFirstChunkAt)
+	appendDurationLine(&timing, "Request -> Downstream First Forwarded Chunk", requestStartedAt, downstreamFirstChunkAt)
+	appendDurationLine(&timing, "Upstream HTTP Response -> Upstream First Chunk", upstreamResponseAt, upstreamFirstChunkAt)
+	appendDurationLine(&timing, "Upstream HTTP Response -> Downstream First Forwarded Chunk", upstreamResponseAt, downstreamFirstChunkAt)
+
+	combined := make([]byte, 0, len(data)+timing.Len()+1)
+	combined = append(combined, data...)
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		combined = append(combined, '\n')
+	}
+	combined = append(combined, timing.String()...)
+	return combined
+}
+
+func lookupTimestamp(c *gin.Context, key string) time.Time {
+	if c == nil {
+		return time.Time{}
+	}
+	value, exists := c.Get(key)
+	if !exists {
+		return time.Time{}
+	}
+	timestamp, ok := value.(time.Time)
+	if !ok {
+		return time.Time{}
+	}
+	return timestamp
+}
+
+func appendTimestampLine(builder *strings.Builder, label string, timestamp time.Time) {
+	if builder == nil || timestamp.IsZero() {
+		return
+	}
+	builder.WriteString(fmt.Sprintf("%s: %s\n", label, timestamp.Format(time.RFC3339Nano)))
+}
+
+func appendDurationLine(builder *strings.Builder, label string, start, end time.Time) {
+	if builder == nil || start.IsZero() || end.IsZero() {
+		return
+	}
+	builder.WriteString(fmt.Sprintf("%s: %s\n", label, formatTimingDuration(end.Sub(start))))
+}
+
+func formatTimingDuration(duration time.Duration) string {
+	if duration < 0 {
+		duration = 0
+	}
+	if duration > time.Minute {
+		return duration.Truncate(time.Millisecond).String()
+	}
+	if duration > time.Second {
+		return duration.Truncate(time.Millisecond).String()
+	}
+	return duration.String()
 }
 
 func (w *ResponseWriterWrapper) extractRequestBody(c *gin.Context) []byte {

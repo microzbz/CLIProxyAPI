@@ -14,8 +14,10 @@ DEPLOY_SCRIPT="${DEPLOY_SCRIPT:-deploy-pgstore-local.sh}"
 LOG_DIR_NAME="${LOG_DIR_NAME:-logs-pgstore-local}"
 RELEASE_ROOT="${RELEASE_ROOT:-release}"
 RELEASE_NAME="${RELEASE_NAME:-pgstore-local}"
-RELEASE_DIR="${RELEASE_ROOT}/${RELEASE_NAME}"
-ARCHIVE_PATH="${RELEASE_ROOT}/${RELEASE_NAME}.tar.gz"
+RELEASE_TIMESTAMP="${RELEASE_TIMESTAMP:-$(date +%Y%m%d-%H%M%S)}"
+RELEASE_BASENAME="${RELEASE_NAME}-${RELEASE_TIMESTAMP}"
+RELEASE_DIR="${RELEASE_ROOT}/${RELEASE_BASENAME}"
+ARCHIVE_PATH="${RELEASE_ROOT}/${RELEASE_BASENAME}.tar.gz"
 IMAGE_TAR_NAME="${IMAGE_NAME//[:\/]/-}.tar"
 
 mkdir -p "${RELEASE_ROOT}"
@@ -64,7 +66,7 @@ printf 'image=%s\ncompose=%s\nconfig=%s\nbuild_script=%s\ndeploy_script=%s\npack
 
 echo "Creating archive: ${ARCHIVE_PATH}"
 rm -f "${ARCHIVE_PATH}"
-tar -czf "${ARCHIVE_PATH}" -C "${RELEASE_ROOT}" "${RELEASE_NAME}"
+tar -czf "${ARCHIVE_PATH}" -C "${RELEASE_ROOT}" "${RELEASE_BASENAME}"
 
 echo "Release ready:"
 echo "  Directory: ${RELEASE_DIR}"

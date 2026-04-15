@@ -1,7 +1,9 @@
 package management
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"time"
 
@@ -76,4 +78,50 @@ func (h *Handler) ImportUsageStatistics(c *gin.Context) {
 		"total_requests":  snapshot.TotalRequests,
 		"failed_requests": snapshot.FailureCount,
 	})
+}
+
+// GetUsageRetentionDays returns the effective usage retention setting.
+func (h *Handler) GetUsageRetentionDays(c *gin.Context) {
+	days := usage.DefaultRetentionDays
+	backend := "memory"
+	editable := false
+	if h != nil && h.usageStats != nil {
+		backend = h.usageStats.UsageBackend()
+		editable = backend != "memory"
+		if value, err := h.usageStats.GetUsageRetentionDays(c.Request.Context()); err == nil {
+			days = value
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"usage-retention-days": days,
+		"backend":              backend,
+		"editable":             editable,
+	})
+}
+
+// PutUsageRetentionDays updates the usage retention setting for durable backends.
+func (h *Handler) PutUsageRetentionDays(c *gin.Context) {
+	if h == nil || h.usageStats == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "usage statistics unavailable"})
+		return
+	}
+	var body struct {
+		Value *int `json:"value"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	days := usage.NormalizeRetentionDays(*body.Value)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+	if err := h.usageStats.SetUsageRetentionDays(ctx, days); err != nil {
+		if errors.Is(err, usage.ErrUsageRetentionUnsupported) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "usage retention requires postgres store"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"usage-retention-days": days, "ok": true})
 }

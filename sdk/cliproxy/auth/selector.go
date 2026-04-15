@@ -400,10 +400,19 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 						return true, blockReasonOther, next
 					}
 				}
+				if blocked, reason, next := authWideQuotaBlock(auth, now); blocked {
+					return true, reason, next
+				}
 				return false, blockReasonNone, time.Time{}
 			}
 		}
+		if blocked, reason, next := authWideQuotaBlock(auth, now); blocked {
+			return true, reason, next
+		}
 		return false, blockReasonNone, time.Time{}
+	}
+	if blocked, reason, next := authWideQuotaBlock(auth, now); blocked {
+		return true, reason, next
 	}
 	if auth.Unavailable && auth.NextRetryAfter.After(now) {
 		next := auth.NextRetryAfter
@@ -419,4 +428,18 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 		return true, blockReasonOther, next
 	}
 	return false, blockReasonNone, time.Time{}
+}
+
+func authWideQuotaBlock(auth *Auth, now time.Time) (bool, blockReason, time.Time) {
+	if auth == nil || !auth.Quota.Exceeded || auth.Quota.Reason != authWideQuotaReasonCodexUsageLimit {
+		return false, blockReasonNone, time.Time{}
+	}
+	next := auth.NextRetryAfter
+	if !auth.Quota.NextRecoverAt.IsZero() && auth.Quota.NextRecoverAt.After(next) {
+		next = auth.Quota.NextRecoverAt
+	}
+	if next.IsZero() || !next.After(now) {
+		return false, blockReasonNone, time.Time{}
+	}
+	return true, blockReasonCooldown, next
 }

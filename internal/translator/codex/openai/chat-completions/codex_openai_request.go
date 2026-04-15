@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -55,7 +56,7 @@ func ConvertOpenAIRequestToCodex(modelName string, inputRawJSON []byte, stream b
 
 	// Map reasoning effort
 	if v := gjson.GetBytes(rawJSON, "reasoning_effort"); v.Exists() {
-		out, _ = sjson.SetBytes(out, "reasoning.effort", v.Value())
+		out, _ = sjson.SetBytes(out, "reasoning.effort", thinking.NormalizeOpenAIEffort(v.String()))
 	} else {
 		out, _ = sjson.SetBytes(out, "reasoning.effort", "medium")
 	}
