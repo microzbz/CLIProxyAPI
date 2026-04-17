@@ -14,6 +14,7 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -28,6 +29,7 @@ const (
 	defaultUsageTable    = "usage_store"
 	defaultConfigKey     = "config"
 	defaultModelsKey     = "default"
+	authRateLimitKey     = "auth_rate_limit"
 	usageRetentionKey    = "usage_retention_days"
 )
 
@@ -43,8 +45,9 @@ type PostgresStoreConfig struct {
 	SpoolDir      string
 }
 
-// PostgresStore persists configuration and authentication metadata using PostgreSQL as backend
-// while mirroring data to a local workspace so existing file-based workflows continue to operate.
+// PostgresStore persists configuration and authentication metadata using PostgreSQL as backend.
+// Local spool paths remain available for config files, logs, and callback helpers, but auth
+// records themselves are treated as database-backed state and no longer depend on mirrored files.
 type PostgresStore struct {
 	db               *sql.DB
 	cfg              PostgresStoreConfig
@@ -232,14 +235,11 @@ func (s *PostgresStore) ensureDefaultUsageRetention(ctx context.Context) error {
 	return nil
 }
 
-// Bootstrap synchronizes auth records between PostgreSQL and the local workspace.
+// Bootstrap ensures the schema exists and prepares the local workspace roots.
 // Configuration is intentionally file-only and is no longer loaded from or persisted to PostgreSQL.
 func (s *PostgresStore) Bootstrap(ctx context.Context, exampleConfigPath string) error {
 	_ = exampleConfigPath
 	if err := s.EnsureSchema(ctx); err != nil {
-		return err
-	}
-	if err := s.syncAuthFromDatabase(ctx); err != nil {
 		return err
 	}
 	return nil
@@ -278,7 +278,7 @@ func (s *PostgresStore) WorkDir() string {
 // the Postgres-backed store controls its own workspace.
 func (s *PostgresStore) SetBaseDir(string) {}
 
-// Save persists authentication metadata to disk and PostgreSQL.
+// Save persists authentication metadata to PostgreSQL.
 func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (string, error) {
 	if auth == nil {
 		return "", fmt.Errorf("postgres store: auth is nil")
@@ -301,10 +301,6 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if err = os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
-		return "", fmt.Errorf("postgres store: create auth directory: %w", err)
-	}
-
 	type metadataSetter interface {
 		SetMetadata(map[string]any)
 	}
@@ -315,12 +311,9 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 		if setter, ok := auth.Storage.(metadataSetter); ok {
 			setter.SetMetadata(auth.Metadata)
 		}
-		if err = auth.Storage.SaveTokenToFile(path); err != nil {
-			return "", err
-		}
-		metadataPayload, err = os.ReadFile(path)
+		metadataPayload, err = s.serializeAuthStorage(auth.Storage)
 		if err != nil {
-			return "", fmt.Errorf("postgres store: read persisted auth file: %w", err)
+			return "", err
 		}
 	case auth.Metadata != nil:
 		auth.Metadata["disabled"] = auth.Disabled
@@ -329,23 +322,6 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 			return "", fmt.Errorf("postgres store: marshal metadata: %w", errMarshal)
 		}
 		metadataPayload = raw
-		shouldWrite := true
-		if existing, errRead := os.ReadFile(path); errRead == nil {
-			if jsonEqual(existing, raw) {
-				shouldWrite = false
-			}
-		} else if errRead != nil && !errors.Is(errRead, fs.ErrNotExist) {
-			return "", fmt.Errorf("postgres store: read existing metadata: %w", errRead)
-		}
-		if shouldWrite {
-			tmp := path + ".tmp"
-			if errWrite := os.WriteFile(tmp, raw, 0o600); errWrite != nil {
-				return "", fmt.Errorf("postgres store: write temp auth file: %w", errWrite)
-			}
-			if errRename := os.Rename(tmp, path); errRename != nil {
-				return "", fmt.Errorf("postgres store: rename auth file: %w", errRename)
-			}
-		}
 	default:
 		return "", fmt.Errorf("postgres store: nothing to persist for %s", auth.ID)
 	}
@@ -407,7 +383,7 @@ func (s *PostgresStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) 
 	return auths, nil
 }
 
-// Delete removes an auth file and the corresponding database record.
+// Delete removes an auth record and opportunistically deletes a mirrored file when present.
 func (s *PostgresStore) Delete(ctx context.Context, id string) error {
 	id = strings.TrimSpace(id)
 	if id == "" {
@@ -431,37 +407,10 @@ func (s *PostgresStore) Delete(ctx context.Context, id string) error {
 	return s.deleteAuthRecord(ctx, relID)
 }
 
-// PersistAuthFiles stores the provided auth file changes in PostgreSQL.
+// PersistAuthFiles is a no-op for PostgreSQL-backed auth state.
+// Auth records are persisted directly through Save/Delete and no longer mirrored from disk.
 func (s *PostgresStore) PersistAuthFiles(ctx context.Context, _ string, paths ...string) error {
-	if len(paths) == 0 {
-		return nil
-	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	for _, p := range paths {
-		trimmed := strings.TrimSpace(p)
-		if trimmed == "" {
-			continue
-		}
-		relID, err := s.relativeAuthID(trimmed)
-		if err != nil {
-			// Attempt to resolve absolute path under authDir.
-			abs := trimmed
-			if !filepath.IsAbs(abs) {
-				abs = filepath.Join(s.authDir, trimmed)
-			}
-			relID, err = s.relativeAuthID(abs)
-			if err != nil {
-				log.WithError(err).Warnf("postgres store: ignoring auth path %s", trimmed)
-				continue
-			}
-			trimmed = abs
-		}
-		if err = s.syncAuthFile(ctx, relID, trimmed); err != nil {
-			return err
-		}
-	}
+	_, _ = ctx, paths
 	return nil
 }
 
@@ -469,6 +418,45 @@ func (s *PostgresStore) PersistAuthFiles(ctx context.Context, _ string, paths ..
 // PostgreSQL is enabled for auth mirroring and usage persistence.
 func (s *PostgresStore) PersistConfig(ctx context.Context) error {
 	_ = ctx
+	return nil
+}
+
+func (s *PostgresStore) LoadAuthRateLimit(ctx context.Context) (internalconfig.AuthRateLimit, error) {
+	if s == nil || s.db == nil {
+		return internalconfig.AuthRateLimit{}, fmt.Errorf("postgres store: not initialized")
+	}
+	query := fmt.Sprintf("SELECT value FROM %s WHERE key = $1", s.fullTableName(s.cfg.SettingsTable))
+	var raw string
+	if err := s.db.QueryRowContext(ctx, query, authRateLimitKey).Scan(&raw); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return internalconfig.AuthRateLimit{}, internalconfig.ErrAuthRateLimitSettingNotFound
+		}
+		return internalconfig.AuthRateLimit{}, fmt.Errorf("postgres store: load auth rate limit: %w", err)
+	}
+	var value internalconfig.AuthRateLimit
+	if err := json.Unmarshal([]byte(raw), &value); err != nil {
+		return internalconfig.AuthRateLimit{}, fmt.Errorf("postgres store: decode auth rate limit: %w", err)
+	}
+	return internalconfig.NormalizeAuthRateLimit(value), nil
+}
+
+func (s *PostgresStore) SaveAuthRateLimit(ctx context.Context, value internalconfig.AuthRateLimit) error {
+	if s == nil || s.db == nil {
+		return fmt.Errorf("postgres store: not initialized")
+	}
+	value = internalconfig.NormalizeAuthRateLimit(value)
+	payload, err := json.Marshal(value)
+	if err != nil {
+		return fmt.Errorf("postgres store: encode auth rate limit: %w", err)
+	}
+	query := fmt.Sprintf(`
+		INSERT INTO %s (key, value, created_at, updated_at)
+		VALUES ($1, $2, NOW(), NOW())
+		ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()
+	`, s.fullTableName(s.cfg.SettingsTable))
+	if _, err := s.db.ExecContext(ctx, query, authRateLimitKey, string(payload)); err != nil {
+		return fmt.Errorf("postgres store: save auth rate limit: %w", err)
+	}
 	return nil
 }
 
@@ -1021,6 +1009,27 @@ func normalizeUsageString(value, fallback string) string {
 		return fallback
 	}
 	return value
+}
+
+func (s *PostgresStore) serializeAuthStorage(storage interface{ SaveTokenToFile(string) error }) ([]byte, error) {
+	if s == nil {
+		return nil, fmt.Errorf("postgres store: not initialized")
+	}
+	tmpDir, err := os.MkdirTemp("", "cliproxy-pg-auth-*")
+	if err != nil {
+		return nil, fmt.Errorf("postgres store: create temp auth dir: %w", err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	tmpPath := filepath.Join(tmpDir, "auth.json")
+	if err := storage.SaveTokenToFile(tmpPath); err != nil {
+		return nil, err
+	}
+	data, err := os.ReadFile(tmpPath)
+	if err != nil {
+		return nil, fmt.Errorf("postgres store: read temp auth file: %w", err)
+	}
+	return data, nil
 }
 
 func (s *PostgresStore) resolveAuthPath(auth *cliproxyauth.Auth) (string, error) {

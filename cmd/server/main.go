@@ -277,6 +277,11 @@ func main() {
 		cfg, err = config.LoadConfigOptional(configFilePath, isCloudDeploy)
 		if err == nil {
 			cfg.AuthDir = pgStoreInst.AuthDir()
+			ctx, cancel = context.WithTimeout(context.Background(), 5*time.Second)
+			if errRate := config.ApplyStoredAuthRateLimit(ctx, cfg, pgStoreInst); errRate != nil {
+				log.WithError(errRate).Warn("failed to load auth-rate-limit from postgres settings store")
+			}
+			cancel()
 			log.Infof("postgres-backed token store enabled, workspace path: %s; config path: %s", pgStoreInst.WorkDir(), configFilePath)
 		}
 	} else if useObjectStore {

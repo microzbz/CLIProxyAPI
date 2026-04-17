@@ -1,6 +1,7 @@
 package store
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"testing"
 	"time"
@@ -34,6 +35,10 @@ func TestDecodePersistedAuthPayloadRoundTripPreservesRuntimeState(t *testing.T) 
 		UpdatedAt:       updatedAt,
 		LastRefreshedAt: lastRefresh,
 		NextRetryAfter:  nextRetry,
+		LocalRateLimit: cliproxyauth.LocalRateLimitState{
+			RequestTimestamps: []time.Time{createdAt.Add(-30 * time.Second), createdAt.Add(-10 * time.Second)},
+			CooldownUntil:     nextRetry,
+		},
 		ModelStates: map[string]*cliproxyauth.ModelState{
 			"gpt-5.4": {
 				Status:         cliproxyauth.StatusError,
@@ -108,6 +113,12 @@ func TestDecodePersistedAuthPayloadRoundTripPreservesRuntimeState(t *testing.T) 
 	if !decoded.LastRefreshedAt.Equal(lastRefresh) || !decoded.NextRetryAfter.Equal(nextRetry) {
 		t.Fatalf("decoded refresh timestamps = last:%v retry:%v, want %v %v", decoded.LastRefreshedAt, decoded.NextRetryAfter, lastRefresh, nextRetry)
 	}
+	if !decoded.LocalRateLimit.CooldownUntil.Equal(nextRetry) {
+		t.Fatalf("decoded local rate cooldown = %v, want %v", decoded.LocalRateLimit.CooldownUntil, nextRetry)
+	}
+	if len(decoded.LocalRateLimit.RequestTimestamps) != 2 {
+		t.Fatalf("decoded local rate timestamps len = %d, want 2", len(decoded.LocalRateLimit.RequestTimestamps))
+	}
 	state := decoded.ModelStates["gpt-5.4"]
 	if state == nil {
 		t.Fatalf("decoded.ModelStates[gpt-5.4] missing")
@@ -158,6 +169,49 @@ func TestDecodePersistedAuthPayloadLegacyMetadataUsesDefaults(t *testing.T) {
 	}
 }
 
+func TestDecodePersistedAuthPayloadHydratesPriorityFromMetadataWhenStateAttributesMissing(t *testing.T) {
+	createdAt := time.Date(2026, 4, 17, 9, 0, 0, 0, time.UTC)
+	updatedAt := createdAt.Add(2 * time.Minute)
+	idToken := testJWTWithPlanType(t, "free")
+	payload := []byte(`{
+		"_pgstore_auth_record_version":2,
+		"metadata":{
+			"type":"codex",
+			"email":"priority@example.com",
+			"priority":10,
+			"id_token":"` + idToken + `"
+		},
+		"state":{
+			"id":"priority.json",
+			"provider":"codex",
+			"file_name":"priority.json",
+			"label":"priority@example.com",
+			"status":"active",
+			"attributes":{"email":"priority@example.com"}
+		}
+	}`)
+
+	auth, _, err := decodePersistedAuthPayload(
+		"priority.json",
+		payload,
+		createdAt,
+		updatedAt,
+		"/tmp/pgstore/auths/priority.json",
+	)
+	if err != nil {
+		t.Fatalf("decodePersistedAuthPayload() error = %v", err)
+	}
+	if got := auth.Attributes["priority"]; got != "10" {
+		t.Fatalf("auth.Attributes[priority] = %q, want %q", got, "10")
+	}
+	if got := auth.Attributes["auth_kind"]; got != "oauth" {
+		t.Fatalf("auth.Attributes[auth_kind] = %q, want %q", got, "oauth")
+	}
+	if got := auth.Attributes["plan_type"]; got != "free" {
+		t.Fatalf("auth.Attributes[plan_type] = %q, want %q", got, "free")
+	}
+}
+
 func TestParseAuthMetadataPayloadRejectsInvalidJSON(t *testing.T) {
 	if _, _, err := parseAuthMetadataPayload([]byte(`{"type"`)); err == nil {
 		t.Fatalf("parseAuthMetadataPayload() error = nil, want non-nil")
@@ -179,4 +233,19 @@ func TestMetadataBoolSupportsMultipleTypes(t *testing.T) {
 	if value, ok := metadataBool(payload, "number_true"); !ok || !value {
 		t.Fatalf("metadataBool(number_true) = %v, %v, want true, true", value, ok)
 	}
+}
+
+func testJWTWithPlanType(t *testing.T, planType string) string {
+	t.Helper()
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none","typ":"JWT"}`))
+	claims, err := json.Marshal(map[string]any{
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_plan_type": planType,
+		},
+	})
+	if err != nil {
+		t.Fatalf("json.Marshal claims error = %v", err)
+	}
+	payload := base64.RawURLEncoding.EncodeToString(claims)
+	return header + "." + payload + ".sig"
 }

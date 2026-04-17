@@ -62,8 +62,17 @@ func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string
 
 	var authFileCount int
 	if rescanAuth {
-		authFileCount = w.loadFileClients(cfg)
-		log.Debugf("loaded %d file-based clients", authFileCount)
+		if w.authStoreSource != nil {
+			w.clientsMutex.Lock()
+			w.lastAuthHashes = make(map[string]string)
+			w.lastAuthContents = nil
+			w.fileAuthsByPath = make(map[string]map[string]*coreauth.Auth)
+			w.clientsMutex.Unlock()
+			log.Debug("authoritative auth store enabled; skipping auth directory scan")
+		} else {
+			authFileCount = w.loadFileClients(cfg)
+			log.Debugf("loaded %d file-based clients", authFileCount)
+		}
 	} else {
 		w.clientsMutex.RLock()
 		authFileCount = len(w.lastAuthHashes)
@@ -71,7 +80,7 @@ func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string
 		log.Debugf("skipping auth directory rescan; retaining %d existing auth files", authFileCount)
 	}
 
-	if rescanAuth {
+	if rescanAuth && w.authStoreSource == nil {
 		w.clientsMutex.Lock()
 
 		w.lastAuthHashes = make(map[string]string)
@@ -312,6 +321,9 @@ func authIDSet(auths map[string]*coreauth.Auth) map[string]*coreauth.Auth {
 }
 
 func (w *Watcher) loadFileClients(cfg *config.Config) int {
+	if w != nil && w.authStoreSource != nil {
+		return 0
+	}
 	authFileCount := 0
 	successfulAuthCount := 0
 

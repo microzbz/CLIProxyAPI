@@ -8,12 +8,49 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
+
+type authoritativeMemoryAuthStore struct {
+	memoryAuthStore
+}
+
+func (s *authoritativeMemoryAuthStore) UseStoreAuthSource() bool {
+	return true
+}
+
+func (s *authoritativeMemoryAuthStore) Save(_ context.Context, auth *coreauth.Auth) (string, error) {
+	if auth == nil {
+		return "", nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.items == nil {
+		s.items = make(map[string]*coreauth.Auth)
+	}
+	key := strings.TrimSpace(auth.FileName)
+	if key == "" && auth.Attributes != nil {
+		key = filepath.Base(strings.TrimSpace(auth.Attributes["path"]))
+	}
+	if key == "" {
+		key = auth.ID
+	}
+	s.items[key] = auth
+	return key, nil
+}
+
+func (s *authoritativeMemoryAuthStore) Delete(_ context.Context, id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.items, id)
+	delete(s.items, filepath.Base(strings.TrimSpace(id)))
+	return nil
+}
 
 func TestDeleteAuthFile_UsesAuthPathFromManager(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
@@ -96,6 +133,55 @@ func TestDeleteAuthFile_UsesAuthPathFromManager(t *testing.T) {
 	}
 	if len(filesRaw) != 0 {
 		t.Fatalf("expected removed auth to be hidden from list, got %d entries", len(filesRaw))
+	}
+}
+
+func TestDeleteAuthFile_AuthoritativeStoreDoesNotRequireLocalFile(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	fileName := "store-only.json"
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	record := &coreauth.Auth{
+		ID:       fileName,
+		FileName: fileName,
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"path": filepath.Join(authDir, fileName),
+		},
+		Metadata: map[string]any{
+			"type": "codex",
+		},
+	}
+	if _, errRegister := manager.Register(context.Background(), record); errRegister != nil {
+		t.Fatalf("failed to register auth record: %v", errRegister)
+	}
+
+	store := &authoritativeMemoryAuthStore{}
+	if _, errSave := store.Save(context.Background(), record); errSave != nil {
+		t.Fatalf("failed to seed store record: %v", errSave)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = store
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodDelete, "/v0/management/auth-files?name="+url.QueryEscape(fileName), nil)
+
+	h.DeleteAuthFile(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected delete status %d, got %d with body %s", http.StatusOK, rec.Code, rec.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(authDir, fileName)); !os.IsNotExist(err) && err != nil {
+		t.Fatalf("expected no local file to exist, stat err: %v", err)
+	}
+	if len(store.items) != 0 {
+		t.Fatalf("expected authoritative store entry to be removed, got %d items", len(store.items))
 	}
 }
 

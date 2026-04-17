@@ -7,7 +7,9 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -176,5 +178,143 @@ func TestListAuthFiles_PaginatesResults(t *testing.T) {
 	}
 	if got := int(payload.Pagination["total_pages"].(float64)); got != 3 {
 		t.Fatalf("pagination.total_pages = %d, want 3", got)
+	}
+}
+
+func TestListAuthFiles_IncludesRateLimitState(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	path := filepath.Join(authDir, "cooldown.json")
+	if err := os.WriteFile(path, []byte(`{"type":"codex"}`), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	next := time.Now().Add(2 * time.Minute)
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "cooldown-auth",
+		FileName: "cooldown.json",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"path": path,
+		},
+		LocalRateLimit: coreauth.LocalRateLimitState{
+			CooldownUntil: next,
+		},
+		Metadata: map[string]any{"type": "codex"},
+	}); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files", nil)
+
+	h.ListAuthFiles(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var payload struct {
+		Files []map[string]any `json:"files"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(payload.Files) != 1 {
+		t.Fatalf("files len = %d, want 1; body=%s", len(payload.Files), rec.Body.String())
+	}
+	if got, _ := payload.Files[0]["rate_limit_status"].(string); got != "cooldown" {
+		t.Fatalf("rate_limit_status = %q, want %q", got, "cooldown")
+	}
+	if got, _ := payload.Files[0]["rate_limited"].(bool); !got {
+		t.Fatalf("rate_limited = %v, want true", got)
+	}
+	if got, ok := payload.Files[0]["rate_limit_scope"].(string); !ok || got != "local-rate-limit" {
+		t.Fatalf("rate_limit_scope = %v, want %q", payload.Files[0]["rate_limit_scope"], "local-rate-limit")
+	}
+	if got, ok := payload.Files[0]["rate_limit_retry_after"].(string); !ok || strings.TrimSpace(got) == "" {
+		t.Fatalf("rate_limit_retry_after = %v, want non-empty RFC3339 string", payload.Files[0]["rate_limit_retry_after"])
+	}
+}
+
+func TestListAuthFiles_FiltersByProviderAndCooldownState(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	next := time.Now().Add(10 * time.Minute)
+
+	register := func(auth *coreauth.Auth) {
+		t.Helper()
+		path := filepath.Join(authDir, auth.FileName)
+		if err := os.WriteFile(path, []byte(`{"type":"`+auth.Provider+`"}`), 0o600); err != nil {
+			t.Fatalf("write auth file %s: %v", auth.FileName, err)
+		}
+		if auth.Attributes == nil {
+			auth.Attributes = map[string]string{}
+		}
+		auth.Attributes["path"] = path
+		if auth.Metadata == nil {
+			auth.Metadata = map[string]any{"type": auth.Provider}
+		}
+		if _, err := manager.Register(context.Background(), auth); err != nil {
+			t.Fatalf("register auth %s: %v", auth.ID, err)
+		}
+	}
+
+	register(&coreauth.Auth{
+		ID:             "codex-cooldown",
+		FileName:       "codex-cooldown.json",
+		Provider:       "codex",
+		Status:         coreauth.StatusError,
+		Unavailable:    true,
+		NextRetryAfter: next,
+	})
+	register(&coreauth.Auth{
+		ID:       "codex-active",
+		FileName: "codex-active.json",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+	})
+	register(&coreauth.Auth{
+		ID:             "claude-cooldown",
+		FileName:       "claude-cooldown.json",
+		Provider:       "claude",
+		Status:         coreauth.StatusError,
+		Unavailable:    true,
+		NextRetryAfter: next,
+	})
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files?provider=codex&state=cooldown", nil)
+
+	h.ListAuthFiles(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var payload struct {
+		Files []map[string]any `json:"files"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(payload.Files) != 1 {
+		t.Fatalf("files len = %d, want 1; body=%s", len(payload.Files), rec.Body.String())
+	}
+	if got, _ := payload.Files[0]["name"].(string); got != "codex-cooldown.json" {
+		t.Fatalf("file name = %q, want %q", got, "codex-cooldown.json")
 	}
 }

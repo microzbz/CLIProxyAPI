@@ -242,6 +242,12 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		c.JSON(500, gin.H{"error": "handler not initialized"})
 		return
 	}
+	providerFilter := strings.ToLower(strings.TrimSpace(c.Query("provider")))
+	stateFilter, ok := normalizeAuthStateFilter(c.Query("state"))
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "state must be cooldown or all"})
+		return
+	}
 	enabledFilter, ok := parseEnabledFilter(c.Query("enabled"), c.Query("disabled"))
 	if !ok {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "enabled must be true/false/enabled/disabled/all"})
@@ -253,7 +259,11 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 	}
 	auths := h.authManager.List()
 	files := make([]gin.H, 0, len(auths))
+	now := time.Now()
 	for _, auth := range auths {
+		if !authMatchesProviderFilter(auth, providerFilter) || !authMatchesStateFilter(auth, stateFilter, now) {
+			continue
+		}
 		if entry := h.buildAuthFileEntry(auth); entry != nil {
 			if !authFileMatchesEnabledFilter(entry, enabledFilter) {
 				continue
@@ -426,6 +436,98 @@ func authFileMatchesEnabledFilter(entry gin.H, enabledFilter *bool) bool {
 	disabled, _ := entry["disabled"].(bool)
 	enabled := !disabled
 	return enabled == *enabledFilter
+}
+
+func normalizeAuthStateFilter(raw string) (string, bool) {
+	value := strings.ToLower(strings.TrimSpace(raw))
+	switch value {
+	case "", "all", "*":
+		return "", true
+	case "cooldown", "blocked", "cooling":
+		return "cooldown", true
+	default:
+		return "", false
+	}
+}
+
+func authMatchesProviderFilter(auth *coreauth.Auth, provider string) bool {
+	if strings.TrimSpace(provider) == "" {
+		return true
+	}
+	if auth == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(auth.Provider), provider)
+}
+
+func authMatchesStateFilter(auth *coreauth.Auth, state string, now time.Time) bool {
+	switch state {
+	case "":
+		return true
+	case "cooldown":
+		return authInCooldownState(auth, now)
+	default:
+		return false
+	}
+}
+
+func authInCooldownState(auth *coreauth.Auth, now time.Time) bool {
+	if auth == nil || auth.Disabled {
+		return false
+	}
+	if auth.LocalRateLimit.CooldownUntil.After(now) || auth.NextRetryAfter.After(now) {
+		return true
+	}
+	if !auth.Quota.NextRecoverAt.IsZero() && auth.Quota.NextRecoverAt.After(now) {
+		return true
+	}
+	for _, state := range auth.ModelStates {
+		if state == nil {
+			continue
+		}
+		if state.NextRetryAfter.After(now) {
+			return true
+		}
+		if !state.Quota.NextRecoverAt.IsZero() && state.Quota.NextRecoverAt.After(now) {
+			return true
+		}
+	}
+	return false
+}
+
+func authCooldownStateDetails(auth *coreauth.Auth, now time.Time) (string, time.Time, string) {
+	if auth == nil || auth.Disabled {
+		return "normal", time.Time{}, ""
+	}
+	if auth.LocalRateLimit.CooldownUntil.After(now) {
+		return "cooldown", auth.LocalRateLimit.CooldownUntil, "local-rate-limit"
+	}
+
+	next := time.Time{}
+	scope := ""
+	updateNext := func(candidate time.Time, candidateScope string) {
+		if !candidate.After(now) {
+			return
+		}
+		if next.IsZero() || candidate.Before(next) {
+			next = candidate
+			scope = candidateScope
+		}
+	}
+
+	updateNext(auth.NextRetryAfter, "auth")
+	updateNext(auth.Quota.NextRecoverAt, "auth")
+	for _, state := range auth.ModelStates {
+		if state == nil {
+			continue
+		}
+		updateNext(state.NextRetryAfter, "model")
+		updateNext(state.Quota.NextRecoverAt, "model")
+	}
+	if next.IsZero() {
+		return "normal", time.Time{}, ""
+	}
+	return "cooldown", next, scope
 }
 
 func (h *Handler) writeAuthFilesResponse(c *gin.Context, files []gin.H) {
@@ -650,6 +752,18 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 			}
 		}
 	}
+	if limit, ok := auth.AuthRateLimitLimitOverride(); ok {
+		entry["auth_rate_limit_limit"] = limit
+	}
+	rateLimitStatus, rateLimitRetryAfter, rateLimitScope := authCooldownStateDetails(auth, time.Now())
+	entry["rate_limit_status"] = rateLimitStatus
+	entry["rate_limited"] = rateLimitStatus == "cooldown"
+	if !rateLimitRetryAfter.IsZero() {
+		entry["rate_limit_retry_after"] = rateLimitRetryAfter
+	}
+	if rateLimitScope != "" {
+		entry["rate_limit_scope"] = rateLimitScope
+	}
 	return entry
 }
 
@@ -740,6 +854,47 @@ func isUnsafeAuthFileName(name string) bool {
 	return false
 }
 
+func (h *Handler) usesAuthoritativeAuthStore() bool {
+	if h == nil {
+		return false
+	}
+	store := h.tokenStoreWithBaseDir()
+	if store == nil {
+		return false
+	}
+	source, ok := store.(interface{ UseStoreAuthSource() bool })
+	return ok && source.UseStoreAuthSource()
+}
+
+func (h *Handler) managedAuthFileNames(enabledFilter *bool) []string {
+	if h == nil || h.authManager == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	names := make([]string, 0)
+	for _, auth := range h.authManager.List() {
+		entry := h.buildAuthFileEntry(auth)
+		if entry == nil {
+			continue
+		}
+		if enabledFilter != nil && !authFileMatchesEnabledFilter(entry, enabledFilter) {
+			continue
+		}
+		name, _ := entry["name"].(string)
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, exists := seen[name]; exists {
+			continue
+		}
+		seen[name] = struct{}{}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
 // Download single auth file by name
 func (h *Handler) DownloadAuthFile(c *gin.Context) {
 	name := strings.TrimSpace(c.Query("name"))
@@ -749,6 +904,20 @@ func (h *Handler) DownloadAuthFile(c *gin.Context) {
 	}
 	if !strings.HasSuffix(strings.ToLower(name), ".json") {
 		c.JSON(400, gin.H{"error": "name must end with .json"})
+		return
+	}
+	if h.authManager != nil && h.usesAuthoritativeAuthStore() {
+		if auth := h.findAuthByNameOrID(name); auth != nil && auth.Metadata != nil {
+			data, err := json.Marshal(auth.Metadata)
+			if err != nil {
+				c.JSON(500, gin.H{"error": fmt.Sprintf("failed to encode auth metadata: %v", err)})
+				return
+			}
+			c.Header("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", name))
+			c.Data(200, "application/json", data)
+			return
+		}
+		c.JSON(404, gin.H{"error": "file not found"})
 		return
 	}
 	full := filepath.Join(h.cfg.AuthDir, name)
@@ -859,60 +1028,27 @@ func (h *Handler) DeleteAuthFile(c *gin.Context) {
 		return
 	}
 	if all := c.Query("all"); all == "true" || all == "1" || all == "*" {
-		if enabledFilter != nil {
-			names := h.filteredVisibleAuthFileNames(enabledFilter)
-			deletedFiles := make([]string, 0, len(names))
-			failed := make([]gin.H, 0)
-			for _, name := range names {
-				deletedName, _, errDelete := h.deleteAuthFileByName(ctx, name)
-				if errDelete != nil {
-					failed = append(failed, gin.H{"name": name, "error": errDelete.Error()})
-					continue
-				}
-				deletedFiles = append(deletedFiles, deletedName)
-			}
-			if len(failed) > 0 {
-				c.JSON(http.StatusMultiStatus, gin.H{
-					"status":  "partial",
-					"deleted": len(deletedFiles),
-					"files":   deletedFiles,
-					"failed":  failed,
-				})
-				return
-			}
-			c.JSON(http.StatusOK, gin.H{"status": "ok", "deleted": len(deletedFiles), "files": deletedFiles})
-			return
-		}
-		entries, err := os.ReadDir(h.cfg.AuthDir)
-		if err != nil {
-			c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
-			return
-		}
-		deleted := 0
-		for _, e := range entries {
-			if e.IsDir() {
+		names := h.managedAuthFileNames(enabledFilter)
+		deletedFiles := make([]string, 0, len(names))
+		failed := make([]gin.H, 0)
+		for _, name := range names {
+			deletedName, _, errDelete := h.deleteAuthFileByName(ctx, name)
+			if errDelete != nil {
+				failed = append(failed, gin.H{"name": name, "error": errDelete.Error()})
 				continue
 			}
-			name := e.Name()
-			if !strings.HasSuffix(strings.ToLower(name), ".json") {
-				continue
-			}
-			full := filepath.Join(h.cfg.AuthDir, name)
-			if !filepath.IsAbs(full) {
-				if abs, errAbs := filepath.Abs(full); errAbs == nil {
-					full = abs
-				}
-			}
-			if err = os.Remove(full); err == nil {
-				if errDel := h.deleteTokenRecord(ctx, full); errDel != nil {
-					c.JSON(500, gin.H{"error": errDel.Error()})
-					return
-				}
-				deleted++
-				h.disableAuth(ctx, full)
-			}
+			deletedFiles = append(deletedFiles, deletedName)
 		}
-		c.JSON(200, gin.H{"status": "ok", "deleted": deleted})
+		if len(failed) > 0 {
+			c.JSON(http.StatusMultiStatus, gin.H{
+				"status":  "partial",
+				"deleted": len(deletedFiles),
+				"files":   deletedFiles,
+				"failed":  failed,
+			})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "deleted": len(deletedFiles), "files": deletedFiles})
 		return
 	}
 
@@ -1086,8 +1222,10 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 	if err != nil {
 		return err
 	}
-	if errWrite := os.WriteFile(dst, data, 0o600); errWrite != nil {
-		return fmt.Errorf("failed to write file: %w", errWrite)
+	if !h.usesAuthoritativeAuthStore() {
+		if errWrite := os.WriteFile(dst, data, 0o600); errWrite != nil {
+			return fmt.Errorf("failed to write file: %w", errWrite)
+		}
 	}
 	if err := h.upsertAuthRecord(ctx, auth); err != nil {
 		return err
@@ -1169,6 +1307,24 @@ func (h *Handler) deleteAuthFileByName(ctx context.Context, name string) (string
 		if path := strings.TrimSpace(authAttribute(targetAuth, "path")); path != "" {
 			targetPath = path
 		}
+	}
+	if h.usesAuthoritativeAuthStore() {
+		deleteKey := strings.TrimSpace(targetPath)
+		if deleteKey == "" {
+			deleteKey = strings.TrimSpace(targetID)
+		}
+		if deleteKey == "" {
+			deleteKey = filepath.Base(name)
+		}
+		if errDeleteRecord := h.deleteTokenRecord(ctx, deleteKey); errDeleteRecord != nil {
+			return filepath.Base(name), http.StatusInternalServerError, errDeleteRecord
+		}
+		if targetID != "" {
+			h.disableAuth(ctx, targetID)
+		} else {
+			h.disableAuth(ctx, deleteKey)
+		}
+		return filepath.Base(name), http.StatusOK, nil
 	}
 	if !filepath.IsAbs(targetPath) {
 		if abs, errAbs := filepath.Abs(targetPath); errAbs == nil {
@@ -1336,6 +1492,10 @@ func preserveExistingAuthRuntimeState(target, existing *coreauth.Auth, hasLastRe
 	target.NextRefreshAfter = existing.NextRefreshAfter
 	target.NextRetryAfter = existing.NextRetryAfter
 	target.Runtime = existing.Runtime
+	target.LocalRateLimit = existing.LocalRateLimit
+	if len(existing.LocalRateLimit.RequestTimestamps) > 0 {
+		target.LocalRateLimit.RequestTimestamps = append([]time.Time(nil), existing.LocalRateLimit.RequestTimestamps...)
+	}
 	target.Prefix = existing.Prefix
 	target.ProxyURL = existing.ProxyURL
 	target.Status = existing.Status
@@ -1408,72 +1568,171 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	}
 
 	var req struct {
-		Name     string `json:"name"`
-		Disabled *bool  `json:"disabled"`
+		Name     string   `json:"name"`
+		Names    []string `json:"names"`
+		Provider string   `json:"provider"`
+		State    string   `json:"state"`
+		Disabled *bool    `json:"disabled"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
 
-	name := strings.TrimSpace(req.Name)
-	if name == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
-		return
-	}
+	names := normalizeAuthStatusPatchNames(req.Name, req.Names)
 	if req.Disabled == nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "disabled is required"})
+		return
+	}
+	providerFilter := strings.ToLower(strings.TrimSpace(req.Provider))
+	stateFilter, ok := normalizeAuthStateFilter(req.State)
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "state must be cooldown or all"})
+		return
+	}
+	if len(names) == 0 && providerFilter == "" && stateFilter == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name, names, provider, or state is required"})
 		return
 	}
 
 	ctx := c.Request.Context()
 
-	// Find auth by name or ID
-	var targetAuth *coreauth.Auth
-	if auth, ok := h.authManager.GetByID(name); ok {
-		targetAuth = auth
-	} else {
-		auths := h.authManager.List()
-		for _, auth := range auths {
-			if auth.FileName == name {
-				targetAuth = auth
-				break
+	now := time.Now()
+	updated := make([]string, 0, len(names))
+	notFound := make([]string, 0)
+	failed := make(map[string]string)
+	skipped := make([]string, 0)
+	targetAuths := make([]*coreauth.Auth, 0)
+
+	if len(names) > 0 {
+		for _, name := range names {
+			targetAuth := h.findAuthByNameOrID(name)
+			if targetAuth == nil {
+				notFound = append(notFound, name)
+				continue
 			}
+			if !authMatchesProviderFilter(targetAuth, providerFilter) || !authMatchesStateFilter(targetAuth, stateFilter, now) {
+				skipped = append(skipped, name)
+				continue
+			}
+			targetAuths = append(targetAuths, targetAuth)
+		}
+	} else {
+		for _, auth := range h.authManager.List() {
+			if !authMatchesProviderFilter(auth, providerFilter) || !authMatchesStateFilter(auth, stateFilter, now) {
+				continue
+			}
+			targetAuths = append(targetAuths, auth)
 		}
 	}
 
-	if targetAuth == nil {
+	for _, targetAuth := range targetAuths {
+		name := targetAuth.FileName
+		if strings.TrimSpace(name) == "" {
+			name = targetAuth.ID
+		}
+
+		affectedModelIDs := collectAuthModelIDsForReset(targetAuth)
+		targetAuth.Disabled = *req.Disabled
+		if *req.Disabled {
+			targetAuth.Status = coreauth.StatusDisabled
+			targetAuth.StatusMessage = "disabled via management API"
+		} else {
+			clearAuthCooldownStateForManagementEnable(targetAuth, now)
+		}
+		targetAuth.UpdatedAt = now
+
+		if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
+			failed[name] = err.Error()
+			continue
+		}
+
+		if !*req.Disabled {
+			reg := registry.GetGlobalRegistry()
+			for _, modelID := range affectedModelIDs {
+				reg.ClearModelQuotaExceeded(targetAuth.ID, modelID)
+				reg.ResumeClientModel(targetAuth.ID, modelID)
+			}
+		}
+		updated = append(updated, name)
+	}
+
+	if len(names) == 1 && len(updated) == 0 && len(notFound) == 1 && len(failed) == 0 {
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
 		return
 	}
-
-	now := time.Now()
-	affectedModelIDs := collectAuthModelIDsForReset(targetAuth)
-
-	// Update disabled state
-	targetAuth.Disabled = *req.Disabled
-	if *req.Disabled {
-		targetAuth.Status = coreauth.StatusDisabled
-		targetAuth.StatusMessage = "disabled via management API"
-	} else {
-		clearAuthCooldownStateForManagementEnable(targetAuth, now)
-	}
-	targetAuth.UpdatedAt = now
-
-	if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
-		return
-	}
-
-	if !*req.Disabled {
-		reg := registry.GetGlobalRegistry()
-		for _, modelID := range affectedModelIDs {
-			reg.ClearModelQuotaExceeded(targetAuth.ID, modelID)
-			reg.ResumeClientModel(targetAuth.ID, modelID)
+	if len(names) == 1 && len(failed) == 1 {
+		for _, message := range failed {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", message)})
+			return
 		}
 	}
 
-	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
+	body := gin.H{
+		"status":   "ok",
+		"disabled": *req.Disabled,
+		"updated":  len(updated),
+		"names":    updated,
+	}
+	if len(notFound) > 0 {
+		body["not_found"] = notFound
+	}
+	if len(skipped) > 0 {
+		body["skipped"] = skipped
+	}
+	if len(failed) > 0 {
+		body["failed"] = failed
+	}
+	if len(notFound) > 0 || len(skipped) > 0 || len(failed) > 0 {
+		c.JSON(http.StatusMultiStatus, body)
+		return
+	}
+	if len(names) == 1 {
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
+		return
+	}
+	c.JSON(http.StatusOK, body)
+}
+
+func normalizeAuthStatusPatchNames(name string, names []string) []string {
+	seen := make(map[string]struct{}, len(names)+1)
+	out := make([]string, 0, len(names)+1)
+	appendName := func(raw string) {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			return
+		}
+		if _, exists := seen[trimmed]; exists {
+			return
+		}
+		seen[trimmed] = struct{}{}
+		out = append(out, trimmed)
+	}
+	appendName(name)
+	for _, item := range names {
+		appendName(item)
+	}
+	return out
+}
+
+func (h *Handler) findAuthByNameOrID(name string) *coreauth.Auth {
+	if h == nil || h.authManager == nil {
+		return nil
+	}
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return nil
+	}
+	if auth, ok := h.authManager.GetByID(name); ok {
+		return auth
+	}
+	auths := h.authManager.List()
+	for _, auth := range auths {
+		if auth != nil && auth.FileName == name {
+			return auth
+		}
+	}
+	return nil
 }
 
 func clearAuthCooldownStateForManagementEnable(auth *coreauth.Auth, now time.Time) {
@@ -1487,6 +1746,7 @@ func clearAuthCooldownStateForManagementEnable(auth *coreauth.Auth, now time.Tim
 	auth.LastError = nil
 	auth.NextRetryAfter = time.Time{}
 	auth.Quota = coreauth.QuotaState{}
+	auth.LocalRateLimit = coreauth.LocalRateLimitState{}
 	auth.UpdatedAt = now
 	for _, state := range auth.ModelStates {
 		if state == nil {

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
@@ -711,6 +712,13 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 		previousStrategy = normalizeStrategy(previousStrategy)
 		nextStrategy = normalizeStrategy(nextStrategy)
+		if tokenStore := sdkAuth.GetTokenStore(); tokenStore != nil {
+			ctxRate, cancelRate := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := internalconfig.ApplyStoredAuthRateLimit(ctxRate, newCfg, tokenStore); err != nil {
+				log.WithError(err).Warn("failed to reload auth-rate-limit from runtime settings store")
+			}
+			cancelRate()
+		}
 		if s.coreManager != nil && previousStrategy != nextStrategy {
 			var selector coreauth.Selector
 			switch nextStrategy {

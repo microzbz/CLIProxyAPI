@@ -333,6 +333,15 @@ func (m configTabModel) parseConfig(cfg map[string]any) []configField {
 	fields = append(fields, configField{"Proxy URL", "proxy-url", "string", getString(cfg, "proxy-url"), nil})
 	fields = append(fields, configField{"Request Retry", "request-retry", "int", fmt.Sprintf("%.0f", getFloat(cfg, "request-retry")), nil})
 	fields = append(fields, configField{"Max Retry Interval (s)", "max-retry-interval", "int", fmt.Sprintf("%.0f", getFloat(cfg, "max-retry-interval")), nil})
+	if rate, ok := cfg["auth-rate-limit"].(map[string]any); ok {
+		fields = append(fields, configField{"Auth Rate Limit", "auth-rate-limit/limit", "int", fmt.Sprintf("%.0f", getFloat(rate, "limit")), nil})
+		fields = append(fields, configField{"Auth Rate Window (s)", "auth-rate-limit/window-seconds", "int", fmt.Sprintf("%.0f", getFloat(rate, "window-seconds")), nil})
+		fields = append(fields, configField{"Auth Rate Cooldown (s)", "auth-rate-limit/cooldown-seconds", "int", fmt.Sprintf("%.0f", getFloat(rate, "cooldown-seconds")), nil})
+	} else {
+		fields = append(fields, configField{"Auth Rate Limit", "auth-rate-limit/limit", "int", "0", nil})
+		fields = append(fields, configField{"Auth Rate Window (s)", "auth-rate-limit/window-seconds", "int", "0", nil})
+		fields = append(fields, configField{"Auth Rate Cooldown (s)", "auth-rate-limit/cooldown-seconds", "int", "0", nil})
+	}
 	fields = append(fields, configField{"Force Model Prefix", "force-model-prefix", "string", getString(cfg, "force-model-prefix"), nil})
 
 	// Logging
@@ -380,7 +389,7 @@ func fieldSection(apiPath string) string {
 		return T("section_routing")
 	}
 	switch apiPath {
-	case "port", "host", "debug", "proxy-url", "request-retry", "max-retry-interval", "force-model-prefix":
+	case "port", "host", "debug", "proxy-url", "request-retry", "max-retry-interval", "auth-rate-limit/limit", "auth-rate-limit/window-seconds", "auth-rate-limit/cooldown-seconds", "force-model-prefix":
 		return T("section_server")
 	case "logging-to-file", "logs-max-total-size-mb", "error-logs-max-files", "request-log-retention-days", "usage-statistics-enabled", "request-log":
 		return T("section_logging")

@@ -63,6 +63,18 @@ func BuildConfigChangeDetails(oldCfg, newCfg *config.Config) []string {
 	if oldCfg.MaxRetryInterval != newCfg.MaxRetryInterval {
 		changes = append(changes, fmt.Sprintf("max-retry-interval: %d -> %d", oldCfg.MaxRetryInterval, newCfg.MaxRetryInterval))
 	}
+	if oldCfg.AuthRateLimit.Limit != newCfg.AuthRateLimit.Limit {
+		changes = append(changes, fmt.Sprintf("auth-rate-limit.limit: %d -> %d", oldCfg.AuthRateLimit.Limit, newCfg.AuthRateLimit.Limit))
+	}
+	if oldCfg.AuthRateLimit.WindowSeconds != newCfg.AuthRateLimit.WindowSeconds {
+		changes = append(changes, fmt.Sprintf("auth-rate-limit.window-seconds: %d -> %d", oldCfg.AuthRateLimit.WindowSeconds, newCfg.AuthRateLimit.WindowSeconds))
+	}
+	if oldCfg.AuthRateLimit.CooldownSeconds != newCfg.AuthRateLimit.CooldownSeconds {
+		changes = append(changes, fmt.Sprintf("auth-rate-limit.cooldown-seconds: %d -> %d", oldCfg.AuthRateLimit.CooldownSeconds, newCfg.AuthRateLimit.CooldownSeconds))
+	}
+	if !reflect.DeepEqual(trimStrings(oldCfg.AuthRateLimit.PerAuthRules), trimStrings(newCfg.AuthRateLimit.PerAuthRules)) {
+		changes = append(changes, fmt.Sprintf("auth-rate-limit.per-auth-rules: updated (%d -> %d entries)", len(oldCfg.AuthRateLimit.PerAuthRules), len(newCfg.AuthRateLimit.PerAuthRules)))
+	}
 	if oldCfg.ProxyURL != newCfg.ProxyURL {
 		changes = append(changes, fmt.Sprintf("proxy-url: %s -> %s", formatProxyURL(oldCfg.ProxyURL), formatProxyURL(newCfg.ProxyURL)))
 	}

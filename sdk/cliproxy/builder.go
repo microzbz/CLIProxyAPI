@@ -4,11 +4,14 @@
 package cliproxy
 
 import (
+	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	configaccess "github.com/router-for-me/CLIProxyAPI/v6/internal/access/config_access"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -205,6 +208,14 @@ func (b *Builder) Build() (*Service, error) {
 		tokenStore := sdkAuth.GetTokenStore()
 		if dirSetter, ok := tokenStore.(interface{ SetBaseDir(string) }); ok && b.cfg != nil {
 			dirSetter.SetBaseDir(b.cfg.AuthDir)
+		}
+		if b.cfg != nil && tokenStore != nil {
+			ctxRate, cancelRate := context.WithTimeout(context.Background(), 5*time.Second)
+			if err := internalconfig.ApplyStoredAuthRateLimit(ctxRate, b.cfg, tokenStore); err != nil {
+				cancelRate()
+				return nil, fmt.Errorf("cliproxy: load auth-rate-limit from runtime settings store: %w", err)
+			}
+			cancelRate()
 		}
 
 		strategy := ""

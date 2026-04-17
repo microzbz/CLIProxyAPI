@@ -92,6 +92,9 @@ type Auth struct {
 	// Runtime carries non-serialisable data used during execution (in-memory only).
 	Runtime any `json:"-"`
 
+	// LocalRateLimit carries in-memory request pacing state for this auth.
+	LocalRateLimit LocalRateLimitState `json:"-"`
+
 	indexAssigned bool `json:"-"`
 }
 
@@ -125,6 +128,12 @@ type ModelState struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// LocalRateLimitState tracks in-memory local pacing state for one auth.
+type LocalRateLimitState struct {
+	RequestTimestamps []time.Time `json:"request_timestamps,omitempty"`
+	CooldownUntil     time.Time   `json:"cooldown_until,omitempty"`
+}
+
 // Clone shallow copies the Auth structure, duplicating maps to avoid accidental mutation.
 func (a *Auth) Clone() *Auth {
 	if a == nil {
@@ -148,6 +157,9 @@ func (a *Auth) Clone() *Auth {
 		for key, state := range a.ModelStates {
 			copyAuth.ModelStates[key] = state.Clone()
 		}
+	}
+	if len(a.LocalRateLimit.RequestTimestamps) > 0 {
+		copyAuth.LocalRateLimit.RequestTimestamps = append([]time.Time(nil), a.LocalRateLimit.RequestTimestamps...)
 	}
 	copyAuth.Runtime = a.Runtime
 	return &copyAuth
@@ -317,6 +329,31 @@ func (a *Auth) RequestRetryOverride() (int, bool) {
 		}
 	}
 	if val, ok := a.Metadata["request-retry"]; ok {
+		if parsed, okParse := parseIntAny(val); okParse {
+			if parsed < 0 {
+				parsed = 0
+			}
+			return parsed, true
+		}
+	}
+	return 0, false
+}
+
+// AuthRateLimitLimitOverride returns the auth-file scoped auth_rate_limit_limit override when present.
+// The value is read from metadata key "auth_rate_limit_limit" (or legacy "auth-rate-limit-limit").
+func (a *Auth) AuthRateLimitLimitOverride() (int, bool) {
+	if a == nil || a.Metadata == nil {
+		return 0, false
+	}
+	if val, ok := a.Metadata["auth_rate_limit_limit"]; ok {
+		if parsed, okParse := parseIntAny(val); okParse {
+			if parsed < 0 {
+				parsed = 0
+			}
+			return parsed, true
+		}
+	}
+	if val, ok := a.Metadata["auth-rate-limit-limit"]; ok {
 		if parsed, okParse := parseIntAny(val); okParse {
 			if parsed < 0 {
 				parsed = 0

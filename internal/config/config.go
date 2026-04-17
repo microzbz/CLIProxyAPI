@@ -6,6 +6,7 @@ package config
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -80,6 +81,9 @@ type Config struct {
 	MaxRetryCredentials int `yaml:"max-retry-credentials" json:"max-retry-credentials"`
 	// MaxRetryInterval defines the maximum wait time in seconds before retrying a cooled-down credential.
 	MaxRetryInterval int `yaml:"max-retry-interval" json:"max-retry-interval"`
+
+	// AuthRateLimit configures local per-auth request pacing to simulate human-like usage.
+	AuthRateLimit AuthRateLimit `yaml:"auth-rate-limit" json:"auth-rate-limit"`
 
 	// QuotaExceeded defines the behavior when a quota is exceeded.
 	QuotaExceeded QuotaExceeded `yaml:"quota-exceeded" json:"quota-exceeded"`
@@ -199,6 +203,32 @@ type QuotaExceeded struct {
 
 	// SwitchPreviewModel indicates whether to automatically switch to a preview model when a quota is exceeded.
 	SwitchPreviewModel bool `yaml:"switch-preview-model" json:"switch-preview-model"`
+}
+
+// AuthRateLimit configures local per-auth rolling-window throttling.
+type AuthRateLimit struct {
+	// Limit is the global per-auth request cap for each rolling window.
+	// Set to 0 to disable the global cap.
+	Limit int `yaml:"limit" json:"limit"`
+
+	// WindowSeconds is the rolling-window length in seconds.
+	// Defaults to 60 when unset or invalid.
+	WindowSeconds int `yaml:"window-seconds" json:"window-seconds"`
+
+	// CooldownSeconds is the local rest period applied after the limit is exceeded.
+	// Defaults to 60 when unset or invalid.
+	CooldownSeconds int `yaml:"cooldown-seconds" json:"cooldown-seconds"`
+
+	// PerAuthRules applies per-auth overrides using rules like:
+	//   email@example.com|limit|5
+	PerAuthRules []string `yaml:"per-auth-rules,omitempty" json:"per-auth-rules,omitempty"`
+}
+
+var ErrAuthRateLimitSettingNotFound = errors.New("auth rate limit setting not found")
+
+type AuthRateLimitStore interface {
+	LoadAuthRateLimit(ctx context.Context) (AuthRateLimit, error)
+	SaveAuthRateLimit(ctx context.Context, value AuthRateLimit) error
 }
 
 // RoutingConfig configures how credentials are selected for requests.
@@ -673,6 +703,9 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	// Validate raw payload rules and drop invalid entries.
 	cfg.SanitizePayloadRules()
 
+	// Normalize local per-auth pacing rules.
+	cfg.SanitizeAuthRateLimit()
+
 	// NOTE: Legacy migration persistence is intentionally disabled together with
 	// startup legacy migration to keep startup read-only for config.yaml.
 	// Re-enable the block below if automatic startup migration is needed again.
@@ -690,6 +723,66 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Return the populated configuration struct.
 	return &cfg, nil
+}
+
+// SanitizeAuthRateLimit normalizes local per-auth pacing configuration.
+func (cfg *Config) SanitizeAuthRateLimit() {
+	if cfg == nil {
+		return
+	}
+	if cfg.AuthRateLimit.Limit < 0 {
+		cfg.AuthRateLimit.Limit = 0
+	}
+	if cfg.AuthRateLimit.WindowSeconds < 0 {
+		cfg.AuthRateLimit.WindowSeconds = 0
+	}
+	if cfg.AuthRateLimit.CooldownSeconds < 0 {
+		cfg.AuthRateLimit.CooldownSeconds = 0
+	}
+	if len(cfg.AuthRateLimit.PerAuthRules) == 0 {
+		cfg.AuthRateLimit.PerAuthRules = nil
+		return
+	}
+	clean := make([]string, 0, len(cfg.AuthRateLimit.PerAuthRules))
+	for _, raw := range cfg.AuthRateLimit.PerAuthRules {
+		trimmed := strings.TrimSpace(raw)
+		if trimmed == "" {
+			continue
+		}
+		clean = append(clean, trimmed)
+	}
+	if len(clean) == 0 {
+		cfg.AuthRateLimit.PerAuthRules = nil
+		return
+	}
+	cfg.AuthRateLimit.PerAuthRules = clean
+}
+
+func NormalizeAuthRateLimit(rate AuthRateLimit) AuthRateLimit {
+	tmp := &Config{AuthRateLimit: rate}
+	tmp.SanitizeAuthRateLimit()
+	return tmp.AuthRateLimit
+}
+
+func ApplyStoredAuthRateLimit(ctx context.Context, cfg *Config, provider any) error {
+	if cfg == nil {
+		return nil
+	}
+	store, ok := provider.(AuthRateLimitStore)
+	if !ok || store == nil {
+		cfg.SanitizeAuthRateLimit()
+		return nil
+	}
+	rate, err := store.LoadAuthRateLimit(ctx)
+	if err != nil {
+		if errors.Is(err, ErrAuthRateLimitSettingNotFound) {
+			cfg.SanitizeAuthRateLimit()
+			return nil
+		}
+		return err
+	}
+	cfg.AuthRateLimit = NormalizeAuthRateLimit(rate)
+	return nil
 }
 
 // SanitizePayloadRules validates raw JSON payload rule params and drops invalid rules.

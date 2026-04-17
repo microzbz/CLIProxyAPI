@@ -43,6 +43,7 @@ type Handler struct {
 	authManager         *coreauth.Manager
 	usageStats          *usage.RequestStatistics
 	tokenStore          coreauth.Store
+	authRateLimitStore  config.AuthRateLimitStore
 	localPassword       string
 	allowRemoteOverride bool
 	envSecret           string
@@ -64,6 +65,9 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		tokenStore:          sdkAuth.GetTokenStore(),
 		allowRemoteOverride: envSecret != "",
 		envSecret:           envSecret,
+	}
+	if store, ok := h.tokenStore.(config.AuthRateLimitStore); ok {
+		h.authRateLimitStore = store
 	}
 	h.startAttemptCleanup()
 	return h
@@ -109,6 +113,28 @@ func (h *Handler) SetConfig(cfg *config.Config) { h.cfg = cfg }
 
 // SetAuthManager updates the auth manager reference used by management endpoints.
 func (h *Handler) SetAuthManager(manager *coreauth.Manager) { h.authManager = manager }
+
+func (h *Handler) syncAuthRateLimitStore() config.AuthRateLimitStore {
+	if h == nil {
+		return nil
+	}
+	if h.authRateLimitStore != nil {
+		return h.authRateLimitStore
+	}
+	if store, ok := h.tokenStore.(config.AuthRateLimitStore); ok {
+		h.authRateLimitStore = store
+		return store
+	}
+	refreshed := sdkAuth.GetTokenStore()
+	if refreshed != nil {
+		h.tokenStore = refreshed
+		if store, ok := refreshed.(config.AuthRateLimitStore); ok {
+			h.authRateLimitStore = store
+			return store
+		}
+	}
+	return nil
+}
 
 // SetUsageStatistics allows replacing the usage statistics reference.
 func (h *Handler) SetUsageStatistics(stats *usage.RequestStatistics) { h.usageStats = stats }

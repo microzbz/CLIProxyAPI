@@ -275,7 +275,11 @@ func (m *Manager) SetConfig(cfg *internalconfig.Config) {
 	if cfg == nil {
 		cfg = &internalconfig.Config{}
 	}
+	prevCfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
 	m.runtimeConfig.Store(cfg)
+	if authRateLimitConfigChanged(prevCfg, cfg) {
+		m.resetAllAuthRateLimitState()
+	}
 	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
 }
 
@@ -1091,6 +1095,10 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			}
 			return cliproxyexecutor.Response{}, errPick
 		}
+		if allowed, _ := m.reserveAuthRateLimit(auth.ID); !allowed {
+			tried[auth.ID] = struct{}{}
+			continue
+		}
 
 		entry := logEntryWithRequestID(ctx)
 		debugLogAuthSelection(entry, auth, provider, req.Model)
@@ -1168,6 +1176,10 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 				return cliproxyexecutor.Response{}, lastErr
 			}
 			return cliproxyexecutor.Response{}, errPick
+		}
+		if allowed, _ := m.reserveAuthRateLimit(auth.ID); !allowed {
+			tried[auth.ID] = struct{}{}
+			continue
 		}
 
 		entry := logEntryWithRequestID(ctx)
@@ -1254,6 +1266,10 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 				return nil, lastErr
 			}
 			return nil, errPick
+		}
+		if allowed, _ := m.reserveAuthRateLimit(auth.ID); !allowed {
+			tried[auth.ID] = struct{}{}
+			continue
 		}
 
 		entry := logEntryWithRequestID(ctx)

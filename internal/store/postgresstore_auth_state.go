@@ -7,13 +7,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
+	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
-const persistedAuthRecordVersion = 1
+const persistedAuthRecordVersion = 2
 
 type persistedAuthRecord struct {
 	RecordVersion int                 `json:"_pgstore_auth_record_version"`
@@ -40,6 +42,7 @@ type persistedAuthState struct {
 	LastRefreshedAt  time.Time                           `json:"last_refreshed_at,omitempty"`
 	NextRefreshAfter time.Time                           `json:"next_refresh_after,omitempty"`
 	NextRetryAfter   time.Time                           `json:"next_retry_after,omitempty"`
+	LocalRateLimit   cliproxyauth.LocalRateLimitState    `json:"local_rate_limit,omitempty"`
 	ModelStates      map[string]*cliproxyauth.ModelState `json:"model_states,omitempty"`
 }
 
@@ -171,6 +174,7 @@ func newPersistedAuthState(auth *cliproxyauth.Auth) *persistedAuthState {
 		LastRefreshedAt:  auth.LastRefreshedAt,
 		NextRefreshAfter: auth.NextRefreshAfter,
 		NextRetryAfter:   auth.NextRetryAfter,
+		LocalRateLimit:   cloneLocalRateLimitState(auth.LocalRateLimit),
 		ModelStates:      cloneModelStates(auth.ModelStates),
 	}
 }
@@ -203,6 +207,7 @@ func buildAuthFromMetadataAndState(relID, path string, metadata map[string]any, 
 	auth.LastRefreshedAt = state.LastRefreshedAt
 	auth.NextRefreshAfter = state.NextRefreshAfter
 	auth.NextRetryAfter = state.NextRetryAfter
+	auth.LocalRateLimit = cloneLocalRateLimitState(state.LocalRateLimit)
 	auth.ModelStates = cloneModelStates(state.ModelStates)
 	if !state.CreatedAt.IsZero() {
 		auth.CreatedAt = state.CreatedAt
@@ -286,6 +291,7 @@ func normalizePersistedAuth(auth *cliproxyauth.Auth, relID string, metadata map[
 	} else {
 		delete(auth.Attributes, "email")
 	}
+	applyMetadataDerivedAttributes(auth, metadata)
 	if auth.Status == "" {
 		if auth.Disabled {
 			auth.Status = cliproxyauth.StatusDisabled
@@ -293,6 +299,71 @@ func normalizePersistedAuth(auth *cliproxyauth.Auth, relID string, metadata map[
 			auth.Status = cliproxyauth.StatusActive
 		}
 	}
+}
+
+func applyMetadataDerivedAttributes(auth *cliproxyauth.Auth, metadata map[string]any) {
+	if auth == nil || auth.Attributes == nil {
+		return
+	}
+
+	if priority, ok := metadataIntString(metadata, "priority"); ok {
+		auth.Attributes["priority"] = priority
+	}
+	if note := strings.TrimSpace(valueAsString(metadata["note"])); note != "" {
+		auth.Attributes["note"] = note
+	}
+	if limit, ok := metadataIntString(metadata, "auth_rate_limit_limit"); ok {
+		auth.Attributes["auth_rate_limit_limit"] = limit
+	} else if limit, ok := metadataIntString(metadata, "auth-rate-limit-limit"); ok {
+		auth.Attributes["auth_rate_limit_limit"] = limit
+	}
+
+	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	if provider == "codex" && strings.TrimSpace(auth.Attributes["auth_kind"]) == "" {
+		auth.Attributes["auth_kind"] = "oauth"
+	}
+	if provider == "codex" && strings.TrimSpace(auth.Attributes["plan_type"]) == "" {
+		if idTokenRaw := strings.TrimSpace(valueAsString(metadata["id_token"])); idTokenRaw != "" {
+			if claims, err := codexauth.ParseJWTToken(idTokenRaw); err == nil && claims != nil {
+				if planType := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); planType != "" {
+					auth.Attributes["plan_type"] = planType
+				}
+			}
+		}
+	}
+}
+
+func metadataIntString(metadata map[string]any, key string) (string, bool) {
+	if len(metadata) == 0 {
+		return "", false
+	}
+	raw, ok := metadata[key]
+	if !ok {
+		return "", false
+	}
+	switch value := raw.(type) {
+	case float64:
+		return strconv.Itoa(int(value)), true
+	case float32:
+		return strconv.Itoa(int(value)), true
+	case int:
+		return strconv.Itoa(value), true
+	case int64:
+		return strconv.FormatInt(value, 10), true
+	case json.Number:
+		if parsed, err := value.Int64(); err == nil {
+			return strconv.FormatInt(parsed, 10), true
+		}
+	case string:
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			return "", false
+		}
+		if _, err := strconv.Atoi(trimmed); err == nil {
+			return trimmed, true
+		}
+	}
+	return "", false
 }
 
 func parseAuthMetadataPayload(payload []byte) (json.RawMessage, map[string]any, error) {
@@ -373,6 +444,14 @@ func cloneModelStates(states map[string]*cliproxyauth.ModelState) map[string]*cl
 		}
 	}
 	return out
+}
+
+func cloneLocalRateLimitState(state cliproxyauth.LocalRateLimitState) cliproxyauth.LocalRateLimitState {
+	clone := state
+	if len(state.RequestTimestamps) > 0 {
+		clone.RequestTimestamps = append([]time.Time(nil), state.RequestTimestamps...)
+	}
+	return clone
 }
 
 func authAttributePath(auth *cliproxyauth.Auth) string {

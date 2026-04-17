@@ -33,11 +33,15 @@ func (w *Watcher) start(ctx context.Context) error {
 	}
 	log.Debugf("watching config file: %s", w.configPath)
 
-	if errAddAuthDir := w.watcher.Add(w.authDir); errAddAuthDir != nil {
-		log.Errorf("failed to watch auth directory %s: %v", w.authDir, errAddAuthDir)
-		return errAddAuthDir
+	if w.authStoreSource == nil {
+		if errAddAuthDir := w.watcher.Add(w.authDir); errAddAuthDir != nil {
+			log.Errorf("failed to watch auth directory %s: %v", w.authDir, errAddAuthDir)
+			return errAddAuthDir
+		}
+		log.Debugf("watching auth directory: %s", w.authDir)
+	} else {
+		log.Debug("authoritative auth store enabled; skipping auth directory watch")
 	}
-	log.Debugf("watching auth directory: %s", w.authDir)
 
 	go w.processEvents(ctx)
 
@@ -65,6 +69,17 @@ func (w *Watcher) processEvents(ctx context.Context) {
 }
 
 func (w *Watcher) handleEvent(event fsnotify.Event) {
+	if w != nil && w.authStoreSource != nil {
+		configOps := fsnotify.Write | fsnotify.Create | fsnotify.Rename
+		normalizedName := w.normalizeAuthPath(event.Name)
+		normalizedConfigPath := w.normalizeAuthPath(w.configPath)
+		if normalizedName == normalizedConfigPath && event.Op&configOps != 0 {
+			log.Debugf("file system event detected: %s %s", event.Op.String(), event.Name)
+			w.scheduleConfigReload()
+		}
+		return
+	}
+
 	// Filter only relevant events: config file or auth-dir JSON files.
 	configOps := fsnotify.Write | fsnotify.Create | fsnotify.Rename
 	normalizedName := w.normalizeAuthPath(event.Name)

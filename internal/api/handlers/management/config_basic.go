@@ -1,7 +1,9 @@
 package management
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -289,6 +291,200 @@ func (h *Handler) GetMaxRetryInterval(c *gin.Context) {
 }
 func (h *Handler) PutMaxRetryInterval(c *gin.Context) {
 	h.updateIntField(c, func(v int) { h.cfg.MaxRetryInterval = v })
+}
+
+// Auth rate limit
+func (h *Handler) GetAuthRateLimit(c *gin.Context) {
+	rate, err := h.loadAuthRateLimit(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load auth rate limit", "message": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, rate)
+}
+
+func (h *Handler) PutAuthRateLimit(c *gin.Context) {
+	var body struct {
+		Limit           *int      `json:"limit"`
+		WindowSeconds   *int      `json:"window-seconds"`
+		CooldownSeconds *int      `json:"cooldown-seconds"`
+		PerAuthRules    *[]string `json:"per-auth-rules"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+
+	rate, err := h.loadAuthRateLimit(c.Request.Context())
+	if err != nil && !errors.Is(err, config.ErrAuthRateLimitSettingNotFound) {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load auth rate limit", "message": err.Error()})
+		return
+	}
+	if body.Limit != nil {
+		rate.Limit = *body.Limit
+	}
+	if body.WindowSeconds != nil {
+		rate.WindowSeconds = *body.WindowSeconds
+	}
+	if body.CooldownSeconds != nil {
+		rate.CooldownSeconds = *body.CooldownSeconds
+	}
+	if body.PerAuthRules != nil {
+		rate.PerAuthRules = append([]string(nil), (*body.PerAuthRules)...)
+	}
+
+	stored, err := h.saveAuthRateLimit(c.Request.Context(), rate)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save auth rate limit", "message": err.Error()})
+		return
+	}
+	if !stored {
+		h.persist(c)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+func (h *Handler) GetAuthRateLimitLimit(c *gin.Context) {
+	rate, err := h.loadAuthRateLimit(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load auth rate limit", "message": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"limit": rate.Limit})
+}
+func (h *Handler) PutAuthRateLimitLimit(c *gin.Context) {
+	var body struct {
+		Value *int `json:"value"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	rate, err := h.loadAuthRateLimit(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load auth rate limit", "message": err.Error()})
+		return
+	}
+	rate.Limit = *body.Value
+	stored, err := h.saveAuthRateLimit(c.Request.Context(), rate)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save auth rate limit", "message": err.Error()})
+		return
+	}
+	if !stored {
+		h.persist(c)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+func (h *Handler) GetAuthRateLimitWindowSeconds(c *gin.Context) {
+	rate, err := h.loadAuthRateLimit(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load auth rate limit", "message": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"window-seconds": rate.WindowSeconds})
+}
+func (h *Handler) PutAuthRateLimitWindowSeconds(c *gin.Context) {
+	var body struct {
+		Value *int `json:"value"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	rate, err := h.loadAuthRateLimit(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load auth rate limit", "message": err.Error()})
+		return
+	}
+	rate.WindowSeconds = *body.Value
+	stored, err := h.saveAuthRateLimit(c.Request.Context(), rate)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save auth rate limit", "message": err.Error()})
+		return
+	}
+	if !stored {
+		h.persist(c)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+func (h *Handler) GetAuthRateLimitCooldownSeconds(c *gin.Context) {
+	rate, err := h.loadAuthRateLimit(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load auth rate limit", "message": err.Error()})
+		return
+	}
+	c.JSON(200, gin.H{"cooldown-seconds": rate.CooldownSeconds})
+}
+func (h *Handler) PutAuthRateLimitCooldownSeconds(c *gin.Context) {
+	var body struct {
+		Value *int `json:"value"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
+		return
+	}
+	rate, err := h.loadAuthRateLimit(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to load auth rate limit", "message": err.Error()})
+		return
+	}
+	rate.CooldownSeconds = *body.Value
+	stored, err := h.saveAuthRateLimit(c.Request.Context(), rate)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to save auth rate limit", "message": err.Error()})
+		return
+	}
+	if !stored {
+		h.persist(c)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+func (h *Handler) loadAuthRateLimit(ctx context.Context) (config.AuthRateLimit, error) {
+	if h == nil || h.cfg == nil {
+		return config.AuthRateLimit{}, nil
+	}
+	rate := config.NormalizeAuthRateLimit(h.cfg.AuthRateLimit)
+	store := h.syncAuthRateLimitStore()
+	if store == nil {
+		h.cfg.AuthRateLimit = rate
+		return rate, nil
+	}
+	stored, err := store.LoadAuthRateLimit(ctx)
+	if err != nil {
+		if errors.Is(err, config.ErrAuthRateLimitSettingNotFound) {
+			h.cfg.AuthRateLimit = rate
+			return rate, nil
+		}
+		return config.AuthRateLimit{}, err
+	}
+	rate = config.NormalizeAuthRateLimit(stored)
+	h.cfg.AuthRateLimit = rate
+	return rate, nil
+}
+
+func (h *Handler) saveAuthRateLimit(ctx context.Context, rate config.AuthRateLimit) (bool, error) {
+	if h == nil || h.cfg == nil {
+		return false, nil
+	}
+	rate = config.NormalizeAuthRateLimit(rate)
+	if store := h.syncAuthRateLimitStore(); store != nil {
+		if err := store.SaveAuthRateLimit(ctx, rate); err != nil {
+			return true, err
+		}
+	}
+	h.cfg.AuthRateLimit = rate
+	if h.authManager != nil {
+		h.authManager.SetConfig(h.cfg)
+	}
+	return h.syncAuthRateLimitStore() != nil, nil
 }
 
 // ForceModelPrefix

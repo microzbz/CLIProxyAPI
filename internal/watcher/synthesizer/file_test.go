@@ -69,12 +69,13 @@ func TestFileSynthesizer_Synthesize_ValidAuthFile(t *testing.T) {
 
 	// Create a valid auth file
 	authData := map[string]any{
-		"type":            "claude",
-		"email":           "test@example.com",
-		"proxy_url":       "http://proxy.local",
-		"prefix":          "test-prefix",
-		"disable_cooling": true,
-		"request_retry":   2,
+		"type":                  "claude",
+		"email":                 "test@example.com",
+		"proxy_url":             "http://proxy.local",
+		"prefix":                "test-prefix",
+		"disable_cooling":       true,
+		"request_retry":         2,
+		"auth_rate_limit_limit": 3,
 	}
 	data, _ := json.Marshal(authData)
 	err := os.WriteFile(filepath.Join(tempDir, "claude-auth.json"), data, 0644)
@@ -115,6 +116,12 @@ func TestFileSynthesizer_Synthesize_ValidAuthFile(t *testing.T) {
 	}
 	if v, ok := auths[0].Metadata["request_retry"].(float64); !ok || int(v) != 2 {
 		t.Errorf("expected request_retry 2, got %v", auths[0].Metadata["request_retry"])
+	}
+	if v, ok := auths[0].Metadata["auth_rate_limit_limit"].(float64); !ok || int(v) != 3 {
+		t.Errorf("expected auth_rate_limit_limit 3, got %v", auths[0].Metadata["auth_rate_limit_limit"])
+	}
+	if got := auths[0].Attributes["auth_rate_limit_limit"]; got != "3" {
+		t.Errorf("expected auth_rate_limit_limit attribute 3, got %q", got)
 	}
 	if auths[0].Status != coreauth.StatusActive {
 		t.Errorf("expected status active, got %s", auths[0].Status)

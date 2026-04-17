@@ -157,6 +157,28 @@ func synthesizeFileAuths(ctx *SynthesisContext, fullPath string, data []byte) []
 			}
 		}
 	}
+	// Read auth rate limit override from auth file.
+	if rawAuthRateLimitLimit, ok := metadata["auth_rate_limit_limit"]; ok {
+		switch v := rawAuthRateLimitLimit.(type) {
+		case float64:
+			a.Attributes["auth_rate_limit_limit"] = strconv.Itoa(int(v))
+		case string:
+			limit := strings.TrimSpace(v)
+			if _, errAtoi := strconv.Atoi(limit); errAtoi == nil {
+				a.Attributes["auth_rate_limit_limit"] = limit
+			}
+		}
+	} else if rawAuthRateLimitLimit, ok := metadata["auth-rate-limit-limit"]; ok {
+		switch v := rawAuthRateLimitLimit.(type) {
+		case float64:
+			a.Attributes["auth_rate_limit_limit"] = strconv.Itoa(int(v))
+		case string:
+			limit := strings.TrimSpace(v)
+			if _, errAtoi := strconv.Atoi(limit); errAtoi == nil {
+				a.Attributes["auth_rate_limit_limit"] = limit
+			}
+		}
+	}
 	ApplyAuthExcludedModelsMeta(a, cfg, perAccountExcluded, "oauth")
 	// For codex auth files, extract plan_type from the JWT id_token.
 	if provider == "codex" {
@@ -233,6 +255,10 @@ func SynthesizeGeminiVirtualAuths(primary *coreauth.Auth, metadata map[string]an
 		if noteVal, hasNote := primary.Attributes["note"]; hasNote && noteVal != "" {
 			attrs["note"] = noteVal
 		}
+		// Propagate auth rate limit override from primary auth to virtual auths.
+		if limitVal, hasLimit := primary.Attributes["auth_rate_limit_limit"]; hasLimit && limitVal != "" {
+			attrs["auth_rate_limit_limit"] = limitVal
+		}
 		metadataCopy := map[string]any{
 			"email":             email,
 			"project_id":        projectID,
@@ -249,6 +275,11 @@ func SynthesizeGeminiVirtualAuths(primary *coreauth.Auth, metadata map[string]an
 			metadataCopy["request_retry"] = v
 		} else if v, ok := metadata["request-retry"]; ok {
 			metadataCopy["request_retry"] = v
+		}
+		if v, ok := metadata["auth_rate_limit_limit"]; ok {
+			metadataCopy["auth_rate_limit_limit"] = v
+		} else if v, ok := metadata["auth-rate-limit-limit"]; ok {
+			metadataCopy["auth_rate_limit_limit"] = v
 		}
 		proxy := strings.TrimSpace(primary.ProxyURL)
 		if proxy != "" {
