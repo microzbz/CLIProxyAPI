@@ -259,6 +259,16 @@ func main() {
 			return
 		}
 		cancel()
+		ctx, cancel = context.WithTimeout(context.Background(), 15*time.Second)
+		if errCatalog := registry.SetCatalogPersistence(ctx, pgStoreInst); errCatalog != nil {
+			log.WithError(errCatalog).Warn("failed to initialize persisted model catalog")
+		}
+		cancel()
+		if !localModel {
+			ctx, cancel = context.WithTimeout(context.Background(), 30*time.Second)
+			registry.RefreshModelsNow(ctx)
+			cancel()
+		}
 		if configPath != "" {
 			configFilePath = configPath
 		} else {

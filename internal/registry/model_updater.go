@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"bytes"
 	"context"
 	_ "embed"
 	"encoding/json"
@@ -44,7 +45,15 @@ var (
 	refreshCallbackMu     sync.Mutex
 	refreshCallback       ModelRefreshCallback
 	pendingRefreshChanges []string
+	catalogPersistenceMu  sync.RWMutex
+	catalogPersistence    CatalogPersistence
 )
+
+// CatalogPersistence stores the resolved models catalog in a durable backend.
+type CatalogPersistence interface {
+	LoadModelsCatalog(ctx context.Context) (payload []byte, source string, updatedAt time.Time, found bool, err error)
+	SaveModelsCatalog(ctx context.Context, payload []byte, source string) error
+}
 
 // SetModelRefreshCallback registers a callback that is invoked when startup or
 // periodic model refresh detects changes. Only one callback is supported;
@@ -71,6 +80,41 @@ func init() {
 	}
 }
 
+// SetCatalogPersistence configures a durable backend for the models catalog and,
+// when data is already present, loads that snapshot into memory before remote refreshes run.
+func SetCatalogPersistence(ctx context.Context, persistence CatalogPersistence) error {
+	catalogPersistenceMu.Lock()
+	catalogPersistence = persistence
+	catalogPersistenceMu.Unlock()
+	if persistence == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	payload, source, updatedAt, found, err := persistence.LoadModelsCatalog(ctx)
+	if err != nil {
+		return err
+	}
+	if !found || len(bytes.TrimSpace(payload)) == 0 {
+		log.Debug("registry: no persisted models catalog found")
+		return nil
+	}
+	if err := loadModelsFromBytes(payload, "persisted"); err != nil {
+		return err
+	}
+	source = strings.TrimSpace(source)
+	if source == "" {
+		source = "database"
+	}
+	if updatedAt.IsZero() {
+		log.Infof("registry: loaded persisted model catalog from %s", source)
+	} else {
+		log.Infof("registry: loaded persisted model catalog from %s (updated_at=%s)", source, updatedAt.UTC().Format(time.RFC3339))
+	}
+	return nil
+}
+
 // StartModelsUpdater starts a background updater that fetches models
 // immediately on startup and then refreshes the model catalog every 3 hours.
 // Safe to call multiple times; only one updater will run.
@@ -78,6 +122,12 @@ func StartModelsUpdater(ctx context.Context) {
 	updaterOnce.Do(func() {
 		go runModelsUpdater(ctx)
 	})
+}
+
+// RefreshModelsNow performs one immediate remote fetch attempt using the same
+// refresh pipeline as the periodic updater.
+func RefreshModelsNow(ctx context.Context) {
+	tryRefreshModels(ctx, "startup model refresh")
 }
 
 func runModelsUpdater(ctx context.Context) {
@@ -115,7 +165,7 @@ func tryStartupRefresh(ctx context.Context) {
 func tryRefreshModels(ctx context.Context, label string) {
 	oldData := getModels()
 
-	parsed, url := fetchModelsFromRemote(ctx)
+	parsed, payload, url := fetchModelsFromRemote(ctx, oldData)
 	if parsed == nil {
 		log.Warnf("%s: fetch failed from all URLs, keeping current data", label)
 		return
@@ -128,6 +178,9 @@ func tryRefreshModels(ctx context.Context, label string) {
 	modelsCatalogStore.mu.Lock()
 	modelsCatalogStore.data = parsed
 	modelsCatalogStore.mu.Unlock()
+	if err := persistModelsCatalog(ctx, payload, url); err != nil {
+		log.WithError(err).Warnf("%s: failed to persist fetched model catalog from %s", label, url)
+	}
 
 	if len(changed) == 0 {
 		log.Infof("%s completed from %s, no changes detected", label, url)
@@ -138,9 +191,9 @@ func tryRefreshModels(ctx context.Context, label string) {
 	notifyModelRefresh(changed)
 }
 
-// fetchModelsFromRemote tries all remote URLs and returns the parsed model catalog
-// along with the URL it was fetched from. Returns (nil, "") if all fetches fail.
-func fetchModelsFromRemote(ctx context.Context) (*staticModelsJSON, string) {
+// fetchModelsFromRemote tries all remote URLs and returns the parsed model catalog,
+// the raw payload, and the URL it was fetched from. Returns (nil, nil, "") if all fetches fail.
+func fetchModelsFromRemote(ctx context.Context, fallback *staticModelsJSON) (*staticModelsJSON, []byte, string) {
 	client := &http.Client{Timeout: modelsFetchTimeout}
 	for _, url := range modelsURLs {
 		reqCtx, cancel := context.WithTimeout(ctx, modelsFetchTimeout)
@@ -179,14 +232,69 @@ func fetchModelsFromRemote(ctx context.Context) (*staticModelsJSON, string) {
 			log.Warnf("models parse failed from %s: %v", url, err)
 			continue
 		}
+		patchEmptyCatalogSections(&parsed, fallback, url)
 		if err := validateModelsCatalog(&parsed); err != nil {
 			log.Warnf("models validate failed from %s: %v", url, err)
 			continue
 		}
+		normalizedPayload, err := json.Marshal(&parsed)
+		if err != nil {
+			log.Warnf("models marshal failed from %s: %v", url, err)
+			continue
+		}
 
-		return &parsed, url
+		return &parsed, normalizedPayload, url
 	}
-	return nil, ""
+	return nil, nil, ""
+}
+
+func patchEmptyCatalogSections(target, fallback *staticModelsJSON, source string) {
+	if target == nil || fallback == nil {
+		return
+	}
+	type section struct {
+		name     string
+		target   *[]*ModelInfo
+		fallback []*ModelInfo
+	}
+	sections := []section{
+		{name: "claude", target: &target.Claude, fallback: fallback.Claude},
+		{name: "gemini", target: &target.Gemini, fallback: fallback.Gemini},
+		{name: "vertex", target: &target.Vertex, fallback: fallback.Vertex},
+		{name: "gemini-cli", target: &target.GeminiCLI, fallback: fallback.GeminiCLI},
+		{name: "aistudio", target: &target.AIStudio, fallback: fallback.AIStudio},
+		{name: "codex-free", target: &target.CodexFree, fallback: fallback.CodexFree},
+		{name: "codex-team", target: &target.CodexTeam, fallback: fallback.CodexTeam},
+		{name: "codex-plus", target: &target.CodexPlus, fallback: fallback.CodexPlus},
+		{name: "codex-pro", target: &target.CodexPro, fallback: fallback.CodexPro},
+		{name: "qwen", target: &target.Qwen, fallback: fallback.Qwen},
+		{name: "iflow", target: &target.IFlow, fallback: fallback.IFlow},
+		{name: "kimi", target: &target.Kimi, fallback: fallback.Kimi},
+		{name: "antigravity", target: &target.Antigravity, fallback: fallback.Antigravity},
+	}
+	for _, item := range sections {
+		if len(*item.target) != 0 || len(item.fallback) == 0 {
+			continue
+		}
+		*item.target = cloneModelInfos(item.fallback)
+		log.Warnf("models fetch from %s returned empty %s section; preserving existing section", source, item.name)
+	}
+}
+
+func persistModelsCatalog(ctx context.Context, payload []byte, source string) error {
+	if len(bytes.TrimSpace(payload)) == 0 {
+		return nil
+	}
+	catalogPersistenceMu.RLock()
+	persistence := catalogPersistence
+	catalogPersistenceMu.RUnlock()
+	if persistence == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return persistence.SaveModelsCatalog(ctx, payload, source)
 }
 
 // detectChangedProviders compares two model catalogs and returns provider names

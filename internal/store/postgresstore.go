@@ -23,9 +23,11 @@ import (
 const (
 	defaultConfigTable   = "config_store"
 	defaultAuthTable     = "auth_store"
+	defaultModelsTable   = "model_catalog_store"
 	defaultSettingsTable = "settings_store"
 	defaultUsageTable    = "usage_store"
 	defaultConfigKey     = "config"
+	defaultModelsKey     = "default"
 	usageRetentionKey    = "usage_retention_days"
 )
 
@@ -35,6 +37,7 @@ type PostgresStoreConfig struct {
 	Schema        string
 	ConfigTable   string
 	AuthTable     string
+	ModelsTable   string
 	SettingsTable string
 	UsageTable    string
 	SpoolDir      string
@@ -65,6 +68,9 @@ func NewPostgresStore(ctx context.Context, cfg PostgresStoreConfig) (*PostgresSt
 	}
 	if cfg.AuthTable == "" {
 		cfg.AuthTable = defaultAuthTable
+	}
+	if cfg.ModelsTable == "" {
+		cfg.ModelsTable = defaultModelsTable
 	}
 	if cfg.SettingsTable == "" {
 		cfg.SettingsTable = defaultSettingsTable
@@ -145,18 +151,30 @@ func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 	}
 	authTable := s.fullTableName(s.cfg.AuthTable)
 	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`
-		CREATE TABLE IF NOT EXISTS %s (
-			id TEXT PRIMARY KEY,
-			content JSONB NOT NULL,
-			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-		)
-	`, authTable)); err != nil {
+			CREATE TABLE IF NOT EXISTS %s (
+				id TEXT PRIMARY KEY,
+				content JSONB NOT NULL,
+				created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+				updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+			)
+		`, authTable)); err != nil {
 		return fmt.Errorf("postgres store: create auth table: %w", err)
+	}
+	modelsTable := s.fullTableName(s.cfg.ModelsTable)
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`
+			CREATE TABLE IF NOT EXISTS %s (
+				id TEXT PRIMARY KEY,
+				source TEXT NOT NULL DEFAULT '',
+				content JSONB NOT NULL,
+				created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+				updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+			)
+		`, modelsTable)); err != nil {
+		return fmt.Errorf("postgres store: create model catalog table: %w", err)
 	}
 	settingsTable := s.fullTableName(s.cfg.SettingsTable)
 	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`
-		CREATE TABLE IF NOT EXISTS %s (
+			CREATE TABLE IF NOT EXISTS %s (
 			key TEXT PRIMARY KEY,
 			value TEXT NOT NULL,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
