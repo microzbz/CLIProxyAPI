@@ -6,7 +6,9 @@ import (
 	"testing"
 	"time"
 
+	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
@@ -100,5 +102,65 @@ func TestBuildAuthFromFileData_PreservesExistingRuntimeState(t *testing.T) {
 	state := rebuilt.ModelStates["gpt-5.4"]
 	if state == nil || state.Status != coreauth.StatusError || !state.Unavailable {
 		t.Fatalf("rebuilt model state = %#v, want preserved error state", state)
+	}
+}
+
+func TestBuildAuthFromFileData_HydratesPriorityFromMetadata(t *testing.T) {
+	authDir := t.TempDir()
+	path := filepath.Join(authDir, "codex.json")
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	rebuilt, err := h.buildAuthFromFileData(path, []byte(`{"type":"codex","email":"priority@example.com","priority":9}`))
+	if err != nil {
+		t.Fatalf("buildAuthFromFileData() error = %v", err)
+	}
+	if got := rebuilt.Attributes["priority"]; got != "9" {
+		t.Fatalf("rebuilt.Attributes[priority] = %q, want %q", got, "9")
+	}
+	if got := rebuilt.Attributes["auth_kind"]; got != "oauth" {
+		t.Fatalf("rebuilt.Attributes[auth_kind] = %q, want %q", got, "oauth")
+	}
+}
+
+func TestSaveTokenRecord_SyncsRuntimeManagerWithSavedTokenMetadata(t *testing.T) {
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = sdkAuth.NewFileTokenStore()
+
+	record := &coreauth.Auth{
+		ID:       "codex-sync.json",
+		Provider: "codex",
+		FileName: "codex-sync.json",
+		Storage: &codexauth.CodexTokenStorage{
+			AccessToken:  "access-token",
+			RefreshToken: "refresh-token",
+			Email:        "sync@example.com",
+			Type:         "codex",
+		},
+		Metadata: map[string]any{
+			"email":    "sync@example.com",
+			"priority": 11,
+		},
+	}
+
+	if _, err := h.saveTokenRecord(context.Background(), record); err != nil {
+		t.Fatalf("saveTokenRecord() error = %v", err)
+	}
+
+	got, ok := manager.GetByID("codex-sync.json")
+	if !ok {
+		t.Fatal("expected saved auth to be registered in runtime manager")
+	}
+	if got.Metadata["access_token"] != "access-token" {
+		t.Fatalf("runtime access_token = %#v, want %q", got.Metadata["access_token"], "access-token")
+	}
+	if got.Attributes["priority"] != "11" {
+		t.Fatalf("runtime priority = %q, want %q", got.Attributes["priority"], "11")
+	}
+	if got.Attributes["auth_kind"] != "oauth" {
+		t.Fatalf("runtime auth_kind = %q, want %q", got.Attributes["auth_kind"], "oauth")
 	}
 }

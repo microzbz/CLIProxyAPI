@@ -52,6 +52,7 @@ type serverOptionConfig struct {
 	keepAliveTimeout     time.Duration
 	keepAliveOnTimeout   func()
 	postAuthHook         auth.PostAuthHook
+	runtimeAuthHook      func(context.Context, *auth.Auth)
 }
 
 // ServerOption customises HTTP server construction.
@@ -114,6 +115,13 @@ func WithRequestLoggerFactory(factory func(*config.Config, string) logging.Reque
 func WithPostAuthHook(hook auth.PostAuthHook) ServerOption {
 	return func(cfg *serverOptionConfig) {
 		cfg.postAuthHook = hook
+	}
+}
+
+// WithRuntimeAuthHook registers a hook to re-apply management auth mutations to runtime routing.
+func WithRuntimeAuthHook(hook func(context.Context, *auth.Auth)) ServerOption {
+	return func(cfg *serverOptionConfig) {
+		cfg.runtimeAuthHook = hook
 	}
 }
 
@@ -270,6 +278,9 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	s.mgmt.SetLogDirectory(logDir)
 	if optionState.postAuthHook != nil {
 		s.mgmt.SetPostAuthHook(optionState.postAuthHook)
+	}
+	if optionState.runtimeAuthHook != nil {
+		s.mgmt.SetRuntimeAuthHook(optionState.runtimeAuthHook)
 	}
 	s.localPassword = optionState.localPassword
 
@@ -699,7 +710,63 @@ func (s *Server) serveManagementControlPanel(c *gin.Context) {
 		}
 	}
 
-	c.File(filePath)
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		log.WithError(err).Error("failed to read management control panel asset")
+		c.AbortWithStatus(http.StatusInternalServerError)
+		return
+	}
+	c.Data(http.StatusOK, "text/html; charset=utf-8", patchManagementControlPanelHTML(data))
+}
+
+func patchManagementControlPanelHTML(data []byte) []byte {
+	if len(data) == 0 {
+		return data
+	}
+	html := string(data)
+	replacements := [][2]string{
+		{`range_all:"全部时间",range_7h:`, `range_all:"全部时间",range_1h:"最近1小时",range_7h:`},
+		{`range_all:"All Time",range_7h:`, `range_all:"All Time",range_1h:"Last 1 Hour",range_7h:`},
+		{`range_all:"За всё время",range_7h:`, `range_all:"За всё время",range_1h:"Последний час",range_7h:`},
+		{`tge=[{value:"all",labelKey:"usage_stats.range_all"},{value:"7h",labelKey:"usage_stats.range_7h"}`, `tge=[{value:"all",labelKey:"usage_stats.range_all"},{value:"1h",labelKey:"usage_stats.range_1h"},{value:"7h",labelKey:"usage_stats.range_7h"}`},
+		{`nge={"7h":7,`, `nge={"1h":1,"7h":7,`},
+		{`ige=t=>t==="7h"||`, `ige=t=>t==="1h"||t==="7h"||`},
+		{`getUsage:()=>Ie.get("/usage",{timeout:$g})`, `getUsage:()=>{let t="24h";try{typeof localStorage<"u"&&(t=localStorage.getItem("cli-proxy-usage-time-range-v1")||t)}catch{}return Ie.get("/usage?range="+encodeURIComponent(t),{timeout:$g})}`},
+		{`r=` + "`${a}::${o}`" + `,c=e()`, `r=` + "`${a}::${o}::${(()=>{try{return typeof localStorage<\"u\"?localStorage.getItem(\"cli-proxy-usage-time-range-v1\")||\"24h\":\"24h\"}catch{return\"24h\"}})()}`" + `,c=e()`},
+		{`S.useEffect(()=>{try{if(typeof localStorage>"u")return;localStorage.setItem(SD,L)}catch{}},[L]);`, `S.useEffect(()=>{try{typeof localStorage<"u"&&localStorage.setItem(SD,L)}catch{}p({force:!0,staleTimeMs:wr}).catch(()=>{})},[L,p]);`},
+		{`const LIST_ENDPOINT = "/v0/management/auth-files?page=1&page_size=2000";`, `const LIST_ENDPOINT = "/v0/management/auth-files?state=cooldown&page=1&page_size=2000";`},
+		{`case "disabled":
+            case "false":
+            case "0":
+              return "disabled";
+            default:`, `case "disabled":
+            case "false":
+            case "0":
+              return "disabled";
+            case "limited":
+            case "rate_limited":
+            case "rate-limited":
+            case "cooldown":
+            case "throttled":
+              return "limited";
+            default:`},
+		{`          } else if (filter === "disabled") {
+            url.searchParams.set("enabled", "false");
+          }
+          return url.toString();`, `          } else if (filter === "disabled") {
+            url.searchParams.set("enabled", "false");
+          } else if (filter === "limited") {
+            url.searchParams.set("state", "cooldown");
+          }
+          return url.toString();`},
+		{`label.textContent = "启用状态";`, `label.textContent = "状态筛选";`},
+		{`'<option value="disabled">已停用</option>';`, `'<option value="disabled">已停用</option>' +
+            '<option value="limited">已限速</option>';`},
+	}
+	for _, replacement := range replacements {
+		html = strings.ReplaceAll(html, replacement[0], replacement[1])
+	}
+	return []byte(html)
 }
 
 func (s *Server) enableKeepAlive(timeout time.Duration, onTimeout func()) {

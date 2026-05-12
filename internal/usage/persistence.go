@@ -33,6 +33,12 @@ type PersistentStore interface {
 	SetUsageRetentionDays(ctx context.Context, days int) error
 }
 
+// PersistentRangeStore can load a bounded usage snapshot without scanning the
+// full retention window.
+type PersistentRangeStore interface {
+	LoadUsageSnapshotSince(ctx context.Context, since time.Time) (StatisticsSnapshot, error)
+}
+
 // NormalizeRetentionDays clamps invalid retention settings to the default.
 func NormalizeRetentionDays(days int) int {
 	if days <= 0 {

@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -26,12 +28,71 @@ type usageImportPayload struct {
 func (h *Handler) GetUsageStatistics(c *gin.Context) {
 	var snapshot usage.StatisticsSnapshot
 	if h != nil && h.usageStats != nil {
-		snapshot = h.usageStats.Snapshot()
+		since, ranged, ok := parseUsageStatisticsRange(c)
+		if !ok {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "range must be all, 1h, 7h, 24h, 7d, hours, or an RFC3339/unix since value"})
+			return
+		}
+		if ranged {
+			snapshot = h.usageStats.SnapshotSince(since)
+		} else {
+			snapshot = h.usageStats.Snapshot()
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{
 		"usage":           snapshot,
 		"failed_requests": snapshot.FailureCount,
 	})
+}
+
+func parseUsageStatisticsRange(c *gin.Context) (time.Time, bool, bool) {
+	if c == nil {
+		return time.Time{}, false, true
+	}
+	if sinceRaw := strings.TrimSpace(c.Query("since")); sinceRaw != "" {
+		since, ok := parseUsageSinceValue(sinceRaw)
+		return since, ok, ok
+	}
+	if hoursRaw := strings.TrimSpace(c.Query("hours")); hoursRaw != "" {
+		hours, err := strconv.ParseFloat(hoursRaw, 64)
+		if err != nil || hours <= 0 {
+			return time.Time{}, false, false
+		}
+		return time.Now().UTC().Add(-time.Duration(hours * float64(time.Hour))), true, true
+	}
+	value := strings.ToLower(strings.TrimSpace(c.Query("range")))
+	if value == "" || value == "all" || value == "*" {
+		return time.Time{}, false, true
+	}
+	duration, ok := map[string]time.Duration{
+		"1h":  time.Hour,
+		"7h":  7 * time.Hour,
+		"24h": 24 * time.Hour,
+		"1d":  24 * time.Hour,
+		"7d":  7 * 24 * time.Hour,
+	}[value]
+	if !ok {
+		return time.Time{}, false, false
+	}
+	return time.Now().UTC().Add(-duration), true, true
+}
+
+func parseUsageSinceValue(raw string) (time.Time, bool) {
+	if ts, err := time.Parse(time.RFC3339, raw); err == nil {
+		return ts.UTC(), true
+	}
+	unixValue, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		return time.Time{}, false
+	}
+	switch {
+	case unixValue > 1_000_000_000_000:
+		return time.UnixMilli(unixValue).UTC(), true
+	case unixValue > 0:
+		return time.Unix(unixValue, 0).UTC(), true
+	default:
+		return time.Time{}, false
+	}
 }
 
 // ExportUsageStatistics returns a complete usage snapshot for backup/migration.

@@ -245,38 +245,69 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 	providerFilter := strings.ToLower(strings.TrimSpace(c.Query("provider")))
 	stateFilter, ok := normalizeAuthStateFilter(c.Query("state"))
 	if !ok {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "state must be cooldown or all"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "state must be cooldown, normal, or all"})
 		return
+	}
+	rateLimitedFilter, ok := parseRateLimitedFilter(c.Query("rate_limited"))
+	if !ok {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "rate_limited must be true/false/all"})
+		return
+	}
+	if rateLimitedFilter != nil {
+		if *rateLimitedFilter {
+			if stateFilter == "normal" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "state and rate_limited filters conflict"})
+				return
+			}
+			stateFilter = "cooldown"
+		} else {
+			if stateFilter == "cooldown" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "state and rate_limited filters conflict"})
+				return
+			}
+			stateFilter = "normal"
+		}
 	}
 	enabledFilter, ok := parseEnabledFilter(c.Query("enabled"), c.Query("disabled"))
 	if !ok {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "enabled must be true/false/enabled/disabled/all"})
 		return
 	}
+	searchFilter := authListSearchQuery(c)
 	if h.authManager == nil {
 		h.listAuthFilesFromDisk(c, enabledFilter)
 		return
 	}
 	auths := h.authManager.List()
-	files := make([]gin.H, 0, len(auths))
+	filtered := make([]*coreauth.Auth, 0, len(auths))
 	now := time.Now()
 	for _, auth := range auths {
+		if !authVisibleInListLight(auth) {
+			continue
+		}
 		if !authMatchesProviderFilter(auth, providerFilter) || !authMatchesStateFilter(auth, stateFilter, now) {
 			continue
 		}
+		if !authMatchesEnabledFilterLight(auth, enabledFilter) || !authMatchesSearchFilter(auth, searchFilter) {
+			continue
+		}
+		filtered = append(filtered, auth)
+	}
+	sort.Slice(filtered, func(i, j int) bool {
+		return strings.ToLower(authListName(filtered[i])) < strings.ToLower(authListName(filtered[j]))
+	})
+	window, pagination, err := authListPaginationWindow(c, len(filtered))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	files := make([]gin.H, 0, window.limit)
+	for _, auth := range filtered[window.start:window.end] {
 		if entry := h.buildAuthFileEntry(auth); entry != nil {
-			if !authFileMatchesEnabledFilter(entry, enabledFilter) {
-				continue
-			}
 			files = append(files, entry)
 		}
 	}
-	sort.Slice(files, func(i, j int) bool {
-		nameI, _ := files[i]["name"].(string)
-		nameJ, _ := files[j]["name"].(string)
-		return strings.ToLower(nameI) < strings.ToLower(nameJ)
-	})
-	h.writeAuthFilesResponse(c, files)
+	c.JSON(http.StatusOK, gin.H{"files": files, "pagination": pagination})
 }
 
 // GetAuthFileModels returns the models supported by a specific auth file
@@ -438,13 +469,42 @@ func authFileMatchesEnabledFilter(entry gin.H, enabledFilter *bool) bool {
 	return enabled == *enabledFilter
 }
 
+func authMatchesEnabledFilterLight(auth *coreauth.Auth, enabledFilter *bool) bool {
+	if enabledFilter == nil {
+		return true
+	}
+	if auth == nil {
+		return false
+	}
+	return !auth.Disabled == *enabledFilter
+}
+
+func parseRateLimitedFilter(raw string) (*bool, bool) {
+	value := strings.ToLower(strings.TrimSpace(raw))
+	if value == "" || value == "all" || value == "any" || value == "*" {
+		return nil, true
+	}
+	switch value {
+	case "1", "true", "yes", "on", "cooldown", "limited", "rate_limited", "rate-limited", "throttled":
+		enabled := true
+		return &enabled, true
+	case "0", "false", "no", "off", "normal", "available":
+		enabled := false
+		return &enabled, true
+	default:
+		return nil, false
+	}
+}
+
 func normalizeAuthStateFilter(raw string) (string, bool) {
 	value := strings.ToLower(strings.TrimSpace(raw))
 	switch value {
 	case "", "all", "*":
 		return "", true
-	case "cooldown", "blocked", "cooling":
+	case "cooldown", "blocked", "cooling", "limited", "rate_limited", "rate-limited", "throttled":
 		return "cooldown", true
+	case "normal", "ok", "available":
+		return "normal", true
 	default:
 		return "", false
 	}
@@ -466,9 +526,130 @@ func authMatchesStateFilter(auth *coreauth.Auth, state string, now time.Time) bo
 		return true
 	case "cooldown":
 		return authInCooldownState(auth, now)
+	case "normal":
+		return !authInCooldownState(auth, now)
 	default:
 		return false
 	}
+}
+
+func authVisibleInListLight(auth *coreauth.Auth) bool {
+	if auth == nil {
+		return false
+	}
+	runtimeOnly := isRuntimeOnlyAuth(auth)
+	if runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled) {
+		return false
+	}
+	path := strings.TrimSpace(authAttribute(auth, "path"))
+	if runtimeOnly {
+		return true
+	}
+	if path == "" {
+		return false
+	}
+	if auth.Disabled || auth.Status == coreauth.StatusDisabled || strings.EqualFold(strings.TrimSpace(auth.StatusMessage), "removed via management api") {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			return false
+		}
+	}
+	return true
+}
+
+func authListSearchQuery(c *gin.Context) string {
+	for _, key := range []string{"search", "q", "keyword"} {
+		if value := strings.TrimSpace(c.Query(key)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func authMatchesSearchFilter(auth *coreauth.Auth, search string) bool {
+	search = strings.TrimSpace(search)
+	if search == "" || search == "*" {
+		return true
+	}
+	if auth == nil {
+		return false
+	}
+	accountType, account := auth.AccountInfo()
+	candidates := []string{
+		auth.ID,
+		auth.FileName,
+		auth.Provider,
+		auth.Prefix,
+		auth.Label,
+		string(auth.Status),
+		auth.StatusMessage,
+		authEmail(auth),
+		accountType,
+		account,
+		authAttribute(auth, "path"),
+		authAttribute(auth, "priority"),
+		authAttribute(auth, "note"),
+	}
+	if auth.Metadata != nil {
+		for _, key := range []string{
+			"type", "email", "account", "account_email", "account_id",
+			"chatgpt_account_id", "username", "name", "note", "priority",
+		} {
+			if raw, ok := auth.Metadata[key]; ok {
+				candidates = append(candidates, fmt.Sprint(raw))
+			}
+		}
+	}
+	for _, candidate := range candidates {
+		if authSearchPatternMatches(search, candidate) {
+			return true
+		}
+	}
+	return false
+}
+
+func authSearchPatternMatches(pattern, value string) bool {
+	pattern = strings.ToLower(strings.TrimSpace(pattern))
+	value = strings.ToLower(strings.TrimSpace(value))
+	if pattern == "" || pattern == "*" {
+		return true
+	}
+	if value == "" {
+		return false
+	}
+	if !strings.Contains(pattern, "*") {
+		return strings.Contains(value, pattern)
+	}
+	parts := strings.Split(pattern, "*")
+	position := 0
+	for i, part := range parts {
+		if part == "" {
+			continue
+		}
+		idx := strings.Index(value[position:], part)
+		if idx < 0 {
+			return false
+		}
+		if i == 0 && !strings.HasPrefix(pattern, "*") && idx != 0 {
+			return false
+		}
+		position += idx + len(part)
+	}
+	last := parts[len(parts)-1]
+	if last != "" && !strings.HasSuffix(pattern, "*") && !strings.HasSuffix(value, last) {
+		return false
+	}
+	return true
+}
+
+func authListName(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	name := strings.TrimSpace(auth.FileName)
+	if name == "" {
+		name = auth.ID
+	}
+	return name
 }
 
 func authInCooldownState(auth *coreauth.Auth, now time.Time) bool {
@@ -539,20 +720,33 @@ func (h *Handler) writeAuthFilesResponse(c *gin.Context, files []gin.H) {
 	c.JSON(http.StatusOK, gin.H{"files": paged, "pagination": pagination})
 }
 
+type authListWindow struct {
+	start int
+	end   int
+	limit int
+}
+
 func paginateAuthFileEntries(c *gin.Context, files []gin.H) ([]gin.H, gin.H, error) {
+	window, pagination, err := authListPaginationWindow(c, len(files))
+	if err != nil {
+		return nil, nil, err
+	}
+	return files[window.start:window.end], pagination, nil
+}
+
+func authListPaginationWindow(c *gin.Context, total int) (authListWindow, gin.H, error) {
 	pageRaw := strings.TrimSpace(c.Query("page"))
 	pageSizeRaw := strings.TrimSpace(c.Query("page_size"))
 	limitRaw := strings.TrimSpace(c.Query("limit"))
 	offsetRaw := strings.TrimSpace(c.Query("offset"))
 
-	total := len(files)
 	if pageRaw == "" && pageSizeRaw == "" && limitRaw == "" && offsetRaw == "" {
 		pageSize := total
 		totalPages := 0
 		if total > 0 {
 			totalPages = 1
 		}
-		return files, gin.H{
+		return authListWindow{start: 0, end: total, limit: pageSize}, gin.H{
 			"page":        1,
 			"page_size":   pageSize,
 			"limit":       pageSize,
@@ -564,19 +758,19 @@ func paginateAuthFileEntries(c *gin.Context, files []gin.H) ([]gin.H, gin.H, err
 
 	page, err := parsePaginationInt(pageRaw, "page", 1, false)
 	if err != nil {
-		return nil, nil, err
+		return authListWindow{}, nil, err
 	}
 	pageSize, err := parsePaginationInt(pageSizeRaw, "page_size", 1, false)
 	if err != nil {
-		return nil, nil, err
+		return authListWindow{}, nil, err
 	}
 	limit, err := parsePaginationInt(limitRaw, "limit", 1, false)
 	if err != nil {
-		return nil, nil, err
+		return authListWindow{}, nil, err
 	}
 	offset, err := parsePaginationInt(offsetRaw, "offset", 0, true)
 	if err != nil {
-		return nil, nil, err
+		return authListWindow{}, nil, err
 	}
 
 	if page != 0 || pageSize != 0 {
@@ -602,7 +796,7 @@ func paginateAuthFileEntries(c *gin.Context, files []gin.H) ([]gin.H, gin.H, err
 	}
 
 	if offset >= total {
-		return []gin.H{}, gin.H{
+		return authListWindow{start: total, end: total, limit: limit}, gin.H{
 			"page":        page,
 			"page_size":   pageSize,
 			"limit":       limit,
@@ -616,7 +810,7 @@ func paginateAuthFileEntries(c *gin.Context, files []gin.H) ([]gin.H, gin.H, err
 	if end > total {
 		end = total
 	}
-	return files[offset:end], gin.H{
+	return authListWindow{start: offset, end: end, limit: limit}, gin.H{
 		"page":        page,
 		"page_size":   pageSize,
 		"limit":       limit,
@@ -1465,6 +1659,7 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 		CreatedAt:  time.Now(),
 		UpdatedAt:  time.Now(),
 	}
+	applyRuntimeMetadataDerivedAttributes(auth, metadata)
 	if hasLastRefresh {
 		auth.LastRefreshedAt = lastRefresh
 	}
@@ -1551,13 +1746,28 @@ func (h *Handler) upsertAuthRecord(ctx context.Context, auth *coreauth.Auth) err
 	if h == nil || h.authManager == nil || auth == nil {
 		return nil
 	}
+	var err error
 	if existing, ok := h.authManager.GetByID(auth.ID); ok {
 		auth.CreatedAt = existing.CreatedAt
-		_, err := h.authManager.Update(ctx, auth)
+		_, err = h.authManager.Update(ctx, auth)
+	} else {
+		_, err = h.authManager.Register(ctx, auth)
+	}
+	if err != nil {
 		return err
 	}
-	_, err := h.authManager.Register(ctx, auth)
-	return err
+	h.notifyRuntimeAuthChanged(ctx, auth)
+	return nil
+}
+
+func (h *Handler) notifyRuntimeAuthChanged(ctx context.Context, auth *coreauth.Auth) {
+	if h == nil || h.runtimeAuthHook == nil || auth == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	h.runtimeAuthHook(coreauth.WithSkipPersist(ctx), auth.Clone())
 }
 
 // PatchAuthFileStatus toggles the disabled state of an auth file
@@ -1646,6 +1856,7 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 			failed[name] = err.Error()
 			continue
 		}
+		h.notifyRuntimeAuthChanged(ctx, targetAuth)
 
 		if !*req.Disabled {
 			reg := registry.GetGlobalRegistry()
@@ -1891,6 +2102,7 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
 		return
 	}
+	h.notifyRuntimeAuthChanged(ctx, targetAuth)
 
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
@@ -1909,6 +2121,7 @@ func (h *Handler) disableAuth(ctx context.Context, id string) {
 		auth.StatusMessage = "removed via management API"
 		auth.UpdatedAt = time.Now()
 		_, _ = h.authManager.Update(ctx, auth)
+		h.notifyRuntimeAuthChanged(ctx, auth)
 		return
 	}
 	authID := h.authIDForPath(id)
@@ -1921,6 +2134,7 @@ func (h *Handler) disableAuth(ctx context.Context, id string) {
 		auth.StatusMessage = "removed via management API"
 		auth.UpdatedAt = time.Now()
 		_, _ = h.authManager.Update(ctx, auth)
+		h.notifyRuntimeAuthChanged(ctx, auth)
 	}
 }
 
@@ -1965,7 +2179,215 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 			return "", fmt.Errorf("post-auth hook failed: %w", err)
 		}
 	}
-	return store.Save(ctx, record)
+	savedPath, err := store.Save(ctx, record)
+	if err != nil {
+		return "", err
+	}
+	if err := h.syncSavedTokenRecord(ctx, store, record, savedPath); err != nil {
+		return "", err
+	}
+	return savedPath, nil
+}
+
+func (h *Handler) syncSavedTokenRecord(ctx context.Context, store coreauth.Store, record *coreauth.Auth, savedPath string) error {
+	if h == nil || h.authManager == nil || record == nil {
+		return nil
+	}
+	auth, err := h.loadSavedTokenRecord(ctx, store, record, savedPath)
+	if err != nil {
+		return err
+	}
+	if auth == nil {
+		auth = record.Clone()
+	}
+	auth = enrichRuntimeAuthFromSavedToken(auth, record, savedPath)
+	return h.upsertAuthRecord(coreauth.WithSkipPersist(ctx), auth)
+}
+
+func (h *Handler) loadSavedTokenRecord(ctx context.Context, store coreauth.Store, record *coreauth.Auth, savedPath string) (*coreauth.Auth, error) {
+	if h == nil || record == nil {
+		return nil, nil
+	}
+	if savedPath != "" && !h.usesAuthoritativeAuthStore() {
+		auth, err := h.buildAuthFromFileData(savedPath, nil)
+		if err == nil {
+			return auth, nil
+		}
+		log.WithError(err).Debugf("failed to rebuild saved auth file %s from disk", savedPath)
+	}
+	if store == nil {
+		return nil, nil
+	}
+	items, err := store.List(ctx)
+	if err != nil {
+		log.WithError(err).Debug("failed to list token store after saving auth record")
+		return nil, nil
+	}
+	for _, item := range items {
+		if savedTokenRecordMatches(item, record, savedPath) {
+			return item.Clone(), nil
+		}
+	}
+	return nil, nil
+}
+
+func savedTokenRecordMatches(candidate, record *coreauth.Auth, savedPath string) bool {
+	if candidate == nil || record == nil {
+		return false
+	}
+	if sameNonEmptyString(candidate.ID, record.ID) || sameNonEmptyString(candidate.FileName, record.FileName) {
+		return true
+	}
+	if savedPath != "" {
+		cleanSaved := filepath.Clean(savedPath)
+		if path := strings.TrimSpace(authAttribute(candidate, "path")); path != "" && filepath.Clean(path) == cleanSaved {
+			return true
+		}
+		if filepath.Base(cleanSaved) != "." {
+			base := filepath.Base(cleanSaved)
+			if sameNonEmptyString(candidate.ID, base) || sameNonEmptyString(candidate.FileName, base) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func sameNonEmptyString(a, b string) bool {
+	a = strings.TrimSpace(a)
+	b = strings.TrimSpace(b)
+	return a != "" && b != "" && a == b
+}
+
+func enrichRuntimeAuthFromSavedToken(auth, saved *coreauth.Auth, savedPath string) *coreauth.Auth {
+	if auth == nil {
+		return nil
+	}
+	if saved == nil {
+		return auth
+	}
+	out := auth.Clone()
+	if out.ID == "" {
+		out.ID = saved.ID
+	}
+	if out.Provider == "" {
+		out.Provider = saved.Provider
+	}
+	if out.FileName == "" {
+		out.FileName = saved.FileName
+	}
+	if out.Label == "" {
+		out.Label = saved.Label
+	}
+	if out.Status == "" {
+		out.Status = coreauth.StatusActive
+	}
+	if out.CreatedAt.IsZero() {
+		out.CreatedAt = time.Now()
+	}
+	if out.UpdatedAt.IsZero() {
+		out.UpdatedAt = time.Now()
+	}
+	if out.Attributes == nil {
+		out.Attributes = make(map[string]string)
+	}
+	if saved.Attributes != nil {
+		for key, value := range saved.Attributes {
+			if _, exists := out.Attributes[key]; !exists {
+				out.Attributes[key] = value
+			}
+		}
+	}
+	if savedPath != "" {
+		out.Attributes["path"] = savedPath
+	}
+	if out.Metadata == nil {
+		out.Metadata = make(map[string]any)
+	}
+	if saved.Storage != nil {
+		if merged, err := misc.MergeMetadata(saved.Storage, saved.Metadata); err == nil {
+			for key, value := range merged {
+				out.Metadata[key] = value
+			}
+		} else {
+			log.WithError(err).Debug("failed to merge saved token metadata for runtime auth")
+		}
+	}
+	if strings.TrimSpace(valueAsString(out.Metadata["type"])) == "" && strings.TrimSpace(out.Provider) != "" {
+		out.Metadata["type"] = out.Provider
+	}
+	applyRuntimeMetadataDerivedAttributes(out, out.Metadata)
+	return out
+}
+
+func applyRuntimeMetadataDerivedAttributes(auth *coreauth.Auth, metadata map[string]any) {
+	if auth == nil {
+		return
+	}
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	if email := strings.TrimSpace(valueAsString(metadata["email"])); email != "" {
+		auth.Attributes["email"] = email
+	}
+	if priority, ok := runtimeMetadataIntString(metadata, "priority"); ok {
+		auth.Attributes["priority"] = priority
+	}
+	if note := strings.TrimSpace(valueAsString(metadata["note"])); note != "" {
+		auth.Attributes["note"] = note
+	}
+	if limit, ok := runtimeMetadataIntString(metadata, "auth_rate_limit_limit"); ok {
+		auth.Attributes["auth_rate_limit_limit"] = limit
+	} else if limit, ok := runtimeMetadataIntString(metadata, "auth-rate-limit-limit"); ok {
+		auth.Attributes["auth_rate_limit_limit"] = limit
+	}
+	if provider := strings.ToLower(strings.TrimSpace(auth.Provider)); provider == "codex" {
+		if strings.TrimSpace(auth.Attributes["auth_kind"]) == "" {
+			auth.Attributes["auth_kind"] = "oauth"
+		}
+		if strings.TrimSpace(auth.Attributes["plan_type"]) == "" {
+			if idTokenRaw := strings.TrimSpace(valueAsString(metadata["id_token"])); idTokenRaw != "" {
+				if claims, err := codex.ParseJWTToken(idTokenRaw); err == nil && claims != nil {
+					if planType := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); planType != "" {
+						auth.Attributes["plan_type"] = planType
+					}
+				}
+			}
+		}
+	}
+}
+
+func runtimeMetadataIntString(metadata map[string]any, key string) (string, bool) {
+	if len(metadata) == 0 {
+		return "", false
+	}
+	raw, ok := metadata[key]
+	if !ok {
+		return "", false
+	}
+	switch value := raw.(type) {
+	case float64:
+		return strconv.Itoa(int(value)), true
+	case float32:
+		return strconv.Itoa(int(value)), true
+	case int:
+		return strconv.Itoa(value), true
+	case int64:
+		return strconv.FormatInt(value, 10), true
+	case json.Number:
+		if parsed, err := value.Int64(); err == nil {
+			return strconv.FormatInt(parsed, 10), true
+		}
+	case string:
+		trimmed := strings.TrimSpace(value)
+		if trimmed == "" {
+			return "", false
+		}
+		if _, err := strconv.Atoi(trimmed); err == nil {
+			return trimmed, true
+		}
+	}
+	return "", false
 }
 
 func (h *Handler) RequestAnthropicToken(c *gin.Context) {

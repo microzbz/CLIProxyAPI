@@ -696,6 +696,33 @@ func (s *PostgresStore) LoadUsageSnapshot(ctx context.Context) (usage.Statistics
 		return usage.StatisticsSnapshot{}, err
 	}
 	cutoff := time.Now().UTC().AddDate(0, 0, -usage.NormalizeRetentionDays(retentionDays))
+	return s.loadUsageSnapshotFrom(ctx, cutoff)
+}
+
+// LoadUsageSnapshotSince aggregates usage rows at or after since.
+func (s *PostgresStore) LoadUsageSnapshotSince(ctx context.Context, since time.Time) (usage.StatisticsSnapshot, error) {
+	if s == nil || s.db == nil {
+		return usage.StatisticsSnapshot{}, fmt.Errorf("postgres store: not initialized")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := s.maybeCleanupUsageRecords(ctx); err != nil {
+		log.WithError(err).Warn("postgres store: usage cleanup failed")
+	}
+	retentionDays, err := s.GetUsageRetentionDays(ctx)
+	if err != nil {
+		return usage.StatisticsSnapshot{}, err
+	}
+	retentionCutoff := time.Now().UTC().AddDate(0, 0, -usage.NormalizeRetentionDays(retentionDays))
+	cutoff := since.UTC()
+	if cutoff.Before(retentionCutoff) {
+		cutoff = retentionCutoff
+	}
+	return s.loadUsageSnapshotFrom(ctx, cutoff)
+}
+
+func (s *PostgresStore) loadUsageSnapshotFrom(ctx context.Context, cutoff time.Time) (usage.StatisticsSnapshot, error) {
 	query := fmt.Sprintf(`
 		SELECT api_name, model, requested_at, latency_ms, source, auth_index, failed,
 		       input_tokens, output_tokens, reasoning_tokens, cached_tokens, total_tokens
@@ -703,7 +730,7 @@ func (s *PostgresStore) LoadUsageSnapshot(ctx context.Context) (usage.Statistics
 		WHERE requested_at >= $1
 		ORDER BY requested_at ASC
 	`, s.fullTableName(s.cfg.UsageTable))
-	rows, err := s.db.QueryContext(ctx, query, cutoff)
+	rows, err := s.db.QueryContext(ctx, query, cutoff.UTC())
 	if err != nil {
 		return usage.StatisticsSnapshot{}, fmt.Errorf("postgres store: query usage rows: %w", err)
 	}

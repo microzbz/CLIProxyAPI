@@ -368,6 +368,108 @@ func (s *RequestStatistics) Snapshot() StatisticsSnapshot {
 	return result
 }
 
+// SnapshotSince returns a snapshot bounded to records at or after since.
+func (s *RequestStatistics) SnapshotSince(since time.Time) StatisticsSnapshot {
+	if since.IsZero() {
+		return s.Snapshot()
+	}
+	since = since.UTC()
+	if store := s.persistent(); store != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if rangeStore, ok := store.(PersistentRangeStore); ok {
+			snapshot, err := rangeStore.LoadUsageSnapshotSince(ctx, since)
+			if err != nil {
+				log.WithError(err).Warn("usage: failed to load ranged persisted usage snapshot")
+				return StatisticsSnapshot{}
+			}
+			return snapshot
+		}
+	}
+	return FilterSnapshotSince(s.Snapshot(), since)
+}
+
+// FilterSnapshotSince rebuilds a snapshot using only details at or after since.
+func FilterSnapshotSince(snapshot StatisticsSnapshot, since time.Time) StatisticsSnapshot {
+	if since.IsZero() {
+		return snapshot
+	}
+	result := emptyStatisticsSnapshot()
+	for apiName, apiSnapshot := range snapshot.APIs {
+		for modelName, modelSnapshot := range apiSnapshot.Models {
+			for _, detail := range modelSnapshot.Details {
+				if detail.Timestamp.IsZero() || detail.Timestamp.Before(since) {
+					continue
+				}
+				appendSnapshotDetail(&result, apiName, modelName, detail)
+			}
+		}
+	}
+	return result
+}
+
+func emptyStatisticsSnapshot() StatisticsSnapshot {
+	return StatisticsSnapshot{
+		APIs:           make(map[string]APISnapshot),
+		RequestsByDay:  make(map[string]int64),
+		RequestsByHour: make(map[string]int64),
+		TokensByDay:    make(map[string]int64),
+		TokensByHour:   make(map[string]int64),
+	}
+}
+
+func appendSnapshotDetail(snapshot *StatisticsSnapshot, apiName, modelName string, detail RequestDetail) {
+	if snapshot == nil {
+		return
+	}
+	if snapshot.APIs == nil {
+		snapshot.APIs = make(map[string]APISnapshot)
+	}
+	if snapshot.RequestsByDay == nil {
+		snapshot.RequestsByDay = make(map[string]int64)
+	}
+	if snapshot.RequestsByHour == nil {
+		snapshot.RequestsByHour = make(map[string]int64)
+	}
+	if snapshot.TokensByDay == nil {
+		snapshot.TokensByDay = make(map[string]int64)
+	}
+	if snapshot.TokensByHour == nil {
+		snapshot.TokensByHour = make(map[string]int64)
+	}
+
+	totalTokens := normaliseTokenStats(detail.Tokens).TotalTokens
+	snapshot.TotalRequests++
+	if detail.Failed {
+		snapshot.FailureCount++
+	} else {
+		snapshot.SuccessCount++
+	}
+	snapshot.TotalTokens += totalTokens
+
+	apiSnapshot := snapshot.APIs[apiName]
+	if apiSnapshot.Models == nil {
+		apiSnapshot.Models = make(map[string]ModelSnapshot)
+	}
+	apiSnapshot.TotalRequests++
+	apiSnapshot.TotalTokens += totalTokens
+
+	modelSnapshot := apiSnapshot.Models[modelName]
+	modelSnapshot.TotalRequests++
+	modelSnapshot.TotalTokens += totalTokens
+	modelSnapshot.Details = append(modelSnapshot.Details, detail)
+	apiSnapshot.Models[modelName] = modelSnapshot
+	snapshot.APIs[apiName] = apiSnapshot
+
+	timestamp := detail.Timestamp.UTC()
+	dayKey := timestamp.Format("2006-01-02")
+	hourKey := fmt.Sprintf("%02d", timestamp.Hour())
+	snapshot.RequestsByDay[dayKey]++
+	snapshot.RequestsByHour[hourKey]++
+	snapshot.TokensByDay[dayKey] += totalTokens
+	snapshot.TokensByHour[hourKey] += totalTokens
+}
+
 type MergeResult struct {
 	Added   int64 `json:"added"`
 	Skipped int64 `json:"skipped"`

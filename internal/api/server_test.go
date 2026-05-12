@@ -46,6 +46,44 @@ func newTestServer(t *testing.T) *Server {
 	return NewServer(cfg, authManager, accessManager, configPath)
 }
 
+func TestPatchManagementControlPanelHTMLAddsRecentOneHourRange(t *testing.T) {
+	input := []byte(`range_all:"全部时间",range_7h:"最近7小时",range_all:"All Time",range_7h:"Last 7 Hours",range_all:"За всё время",range_7h:"Последние 7 часов",tge=[{value:"all",labelKey:"usage_stats.range_all"},{value:"7h",labelKey:"usage_stats.range_7h"}],nge={"7h":7,"24h":24},ige=t=>t==="7h"||t==="24h"||t==="7d"||t==="all",getUsage:()=>Ie.get("/usage",{timeout:$g}),r=` + "`${a}::${o}`" + `,c=e(),S.useEffect(()=>{try{if(typeof localStorage>"u")return;localStorage.setItem(SD,L)}catch{}},[L]);const LIST_ENDPOINT = "/v0/management/auth-files?page=1&page_size=2000";case "disabled":
+            case "false":
+            case "0":
+              return "disabled";
+            default:          } else if (filter === "disabled") {
+            url.searchParams.set("enabled", "false");
+          }
+          return url.toString();label.textContent = "启用状态";'<option value="disabled">已停用</option>';`)
+
+	patched := string(patchManagementControlPanelHTML(input))
+	for _, want := range []string{
+		`range_1h:"最近1小时"`,
+		`range_1h:"Last 1 Hour"`,
+		`range_1h:"Последний час"`,
+		`{value:"1h",labelKey:"usage_stats.range_1h"}`,
+		`nge={"1h":1,"7h":7`,
+		`ige=t=>t==="1h"||t==="7h"||`,
+		`/usage?range=`,
+		`cli-proxy-usage-time-range-v1`,
+		`p({force:!0,staleTimeMs:wr})`,
+		`/v0/management/auth-files?state=cooldown&page=1&page_size=2000`,
+		`case "limited":`,
+		`url.searchParams.set("state", "cooldown")`,
+		`label.textContent = "状态筛选"`,
+		`<option value="limited">已限速</option>`,
+	} {
+		if !strings.Contains(patched, want) {
+			t.Fatalf("patched management html missing %q in %s", want, patched)
+		}
+	}
+
+	patchedAgain := string(patchManagementControlPanelHTML([]byte(patched)))
+	if patchedAgain != patched {
+		t.Fatal("patchManagementControlPanelHTML should be idempotent")
+	}
+}
+
 func TestAmpProviderModelRoutes(t *testing.T) {
 	testCases := []struct {
 		name         string

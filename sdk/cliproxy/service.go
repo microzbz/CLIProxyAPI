@@ -595,8 +595,15 @@ func (s *Service) Run(ctx context.Context) error {
 
 	// legacy clients removed; no caches to refresh
 
+	// Management API mutations must go through the service registration path so
+	// executors, model registry entries, and scheduler state are rebuilt together.
+	serverOptions := append([]api.ServerOption(nil), s.serverOptions...)
+	serverOptions = append(serverOptions, api.WithRuntimeAuthHook(func(ctx context.Context, auth *coreauth.Auth) {
+		s.applyCoreAuthAddOrUpdate(coreauth.WithSkipPersist(ctx), auth)
+	}))
+
 	// handlers no longer depend on legacy clients; pass nil slice initially
-	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, s.serverOptions...)
+	s.server = api.NewServer(s.cfg, s.coreManager, s.accessManager, s.configPath, serverOptions...)
 
 	if s.authManager == nil {
 		s.authManager = newDefaultAuthManager()

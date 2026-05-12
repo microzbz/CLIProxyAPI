@@ -3,6 +3,7 @@
 package management
 
 import (
+	"context"
 	"crypto/subtle"
 	"fmt"
 	"net/http"
@@ -49,6 +50,7 @@ type Handler struct {
 	envSecret           string
 	logDir              string
 	postAuthHook        coreauth.PostAuthHook
+	runtimeAuthHook     func(context.Context, *coreauth.Auth)
 }
 
 // NewHandler creates a new management handler instance.
@@ -158,6 +160,11 @@ func (h *Handler) SetLogDirectory(dir string) {
 // SetPostAuthHook registers a hook to be called after auth record creation but before persistence.
 func (h *Handler) SetPostAuthHook(hook coreauth.PostAuthHook) {
 	h.postAuthHook = hook
+}
+
+// SetRuntimeAuthHook registers a hook to re-apply runtime auth changes.
+func (h *Handler) SetRuntimeAuthHook(hook func(context.Context, *coreauth.Auth)) {
+	h.runtimeAuthHook = hook
 }
 
 // Middleware enforces access control for management endpoints.

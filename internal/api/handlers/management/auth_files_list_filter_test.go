@@ -318,3 +318,127 @@ func TestListAuthFiles_FiltersByProviderAndCooldownState(t *testing.T) {
 		t.Fatalf("file name = %q, want %q", got, "codex-cooldown.json")
 	}
 }
+
+func TestListAuthFiles_SearchesBeforePaging(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	register := func(name, email string) {
+		t.Helper()
+		path := filepath.Join(authDir, name)
+		if err := os.WriteFile(path, []byte(`{"type":"codex"}`), 0o600); err != nil {
+			t.Fatalf("write auth file %s: %v", name, err)
+		}
+		if _, err := manager.Register(context.Background(), &coreauth.Auth{
+			ID:       name,
+			FileName: name,
+			Provider: "codex",
+			Status:   coreauth.StatusActive,
+			Attributes: map[string]string{
+				"path": path,
+			},
+			Metadata: map[string]any{
+				"type":  "codex",
+				"email": email,
+			},
+		}); err != nil {
+			t.Fatalf("register auth %s: %v", name, err)
+		}
+	}
+	register("a.json", "alpha@example.com")
+	register("b.json", "rodriquezjude046@example.com")
+	register("c.json", "charlie@example.com")
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files?search=*jude046*&page=1&page_size=1", nil)
+
+	h.ListAuthFiles(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var payload struct {
+		Files      []map[string]any `json:"files"`
+		Pagination map[string]any   `json:"pagination"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(payload.Files) != 1 {
+		t.Fatalf("files len = %d, want 1; body=%s", len(payload.Files), rec.Body.String())
+	}
+	if got, _ := payload.Files[0]["name"].(string); got != "b.json" {
+		t.Fatalf("file name = %q, want %q", got, "b.json")
+	}
+	if got := int(payload.Pagination["total"].(float64)); got != 1 {
+		t.Fatalf("pagination.total = %d, want 1", got)
+	}
+}
+
+func TestListAuthFiles_FiltersByRateLimitedAlias(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	next := time.Now().Add(10 * time.Minute)
+	register := func(auth *coreauth.Auth) {
+		t.Helper()
+		path := filepath.Join(authDir, auth.FileName)
+		if err := os.WriteFile(path, []byte(`{"type":"`+auth.Provider+`"}`), 0o600); err != nil {
+			t.Fatalf("write auth file %s: %v", auth.FileName, err)
+		}
+		if auth.Attributes == nil {
+			auth.Attributes = map[string]string{}
+		}
+		auth.Attributes["path"] = path
+		if auth.Metadata == nil {
+			auth.Metadata = map[string]any{"type": auth.Provider}
+		}
+		if _, err := manager.Register(context.Background(), auth); err != nil {
+			t.Fatalf("register auth %s: %v", auth.ID, err)
+		}
+	}
+	register(&coreauth.Auth{
+		ID:             "limited",
+		FileName:       "limited.json",
+		Provider:       "codex",
+		Status:         coreauth.StatusError,
+		NextRetryAfter: next,
+	})
+	register(&coreauth.Auth{
+		ID:       "normal",
+		FileName: "normal.json",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+	})
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files?rate_limited=true", nil)
+
+	h.ListAuthFiles(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var payload struct {
+		Files []map[string]any `json:"files"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(payload.Files) != 1 {
+		t.Fatalf("files len = %d, want 1; body=%s", len(payload.Files), rec.Body.String())
+	}
+	if got, _ := payload.Files[0]["name"].(string); got != "limited.json" {
+		t.Fatalf("file name = %q, want %q", got, "limited.json")
+	}
+}

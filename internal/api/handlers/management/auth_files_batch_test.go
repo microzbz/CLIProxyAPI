@@ -2,6 +2,7 @@ package management
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"mime/multipart"
 	"net/http"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
@@ -81,6 +83,77 @@ func TestUploadAuthFile_BatchMultipart(t *testing.T) {
 	auths := manager.List()
 	if len(auths) != len(files) {
 		t.Fatalf("expected %d auth entries, got %d", len(files), len(auths))
+	}
+}
+
+func TestUploadAuthFile_NotifiesRuntimeHookForModelRegistration(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	var hookedAuthID string
+	h.SetRuntimeAuthHook(func(_ context.Context, auth *coreauth.Auth) {
+		if auth == nil {
+			return
+		}
+		hookedAuthID = auth.ID
+		registry.GetGlobalRegistry().RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: "gpt-5-test"}})
+	})
+	t.Cleanup(func() {
+		if hookedAuthID != "" {
+			registry.GetGlobalRegistry().UnregisterClient(hookedAuthID)
+		}
+	})
+
+	var body bytes.Buffer
+	writer := multipart.NewWriter(&body)
+	part, err := writer.CreateFormFile("file", "codex-hook.json")
+	if err != nil {
+		t.Fatalf("failed to create multipart file: %v", err)
+	}
+	if _, err = part.Write([]byte(`{"type":"codex","email":"hook@example.com"}`)); err != nil {
+		t.Fatalf("failed to write multipart file: %v", err)
+	}
+	if err = writer.Close(); err != nil {
+		t.Fatalf("failed to close multipart writer: %v", err)
+	}
+
+	uploadReq := httptest.NewRequest(http.MethodPost, "/auth-files", &body)
+	uploadReq.Header.Set("Content-Type", writer.FormDataContentType())
+	uploadRec := httptest.NewRecorder()
+	uploadCtx, _ := gin.CreateTestContext(uploadRec)
+	uploadCtx.Request = uploadReq
+
+	h.UploadAuthFile(uploadCtx)
+	if uploadRec.Code != http.StatusOK {
+		t.Fatalf("expected upload status 200, got %d body=%s", uploadRec.Code, uploadRec.Body.String())
+	}
+	if hookedAuthID == "" {
+		t.Fatal("expected runtime hook to be called")
+	}
+
+	modelReq := httptest.NewRequest(http.MethodGet, "/auth-files/models?name=codex-hook.json", nil)
+	modelRec := httptest.NewRecorder()
+	modelCtx, _ := gin.CreateTestContext(modelRec)
+	modelCtx.Request = modelReq
+
+	h.GetAuthFileModels(modelCtx)
+	if modelRec.Code != http.StatusOK {
+		t.Fatalf("expected models status 200, got %d body=%s", modelRec.Code, modelRec.Body.String())
+	}
+	var payload struct {
+		Models []struct {
+			ID string `json:"id"`
+		} `json:"models"`
+	}
+	if err = json.Unmarshal(modelRec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("failed to decode models response: %v", err)
+	}
+	if len(payload.Models) != 1 || payload.Models[0].ID != "gpt-5-test" {
+		t.Fatalf("expected registered model to be returned, got %+v", payload.Models)
 	}
 }
 
