@@ -944,9 +944,9 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(authClone)
 	}
-	_ = m.persist(ctx, auth)
+	persistErr := m.persist(ctx, auth)
 	m.hook.OnAuthUpdated(ctx, auth.Clone())
-	return auth.Clone(), nil
+	return auth.Clone(), persistErr
 }
 
 // Load resets manager state from the backing store.
@@ -2634,7 +2634,7 @@ func (m *Manager) checkRefreshes(ctx context.Context) {
 
 func (m *Manager) refreshAuthWithLimit(ctx context.Context, id string) {
 	if m.refreshSemaphore == nil {
-		m.refreshAuth(ctx, id)
+		_ = m.refreshAuth(ctx, id)
 		return
 	}
 	select {
@@ -2643,7 +2643,14 @@ func (m *Manager) refreshAuthWithLimit(ctx context.Context, id string) {
 	case <-ctx.Done():
 		return
 	}
-	m.refreshAuth(ctx, id)
+	_ = m.refreshAuth(ctx, id)
+}
+
+// RefreshAuth immediately refreshes a credential by ID. It is intended for
+// operator-triggered refreshes and re-enables credentials that were disabled by
+// fatal upstream auth errors after a successful refresh.
+func (m *Manager) RefreshAuth(ctx context.Context, id string) error {
+	return m.refreshAuthInternal(ctx, id, true)
 }
 
 func (m *Manager) snapshotAuths() []*Auth {
@@ -2876,7 +2883,11 @@ func (m *Manager) markRefreshPending(id string, now time.Time) bool {
 	return true
 }
 
-func (m *Manager) refreshAuth(ctx context.Context, id string) {
+func (m *Manager) refreshAuth(ctx context.Context, id string) error {
+	return m.refreshAuthInternal(ctx, id, false)
+}
+
+func (m *Manager) refreshAuthInternal(ctx context.Context, id string, enableOnSuccess bool) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -2887,29 +2898,39 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 		exec = m.executors[auth.Provider]
 	}
 	m.mu.RUnlock()
-	if auth == nil || exec == nil {
-		return
+	if auth == nil {
+		return errors.New("auth not found")
+	}
+	if exec == nil {
+		return errors.New("auth executor unavailable")
 	}
 	cloned := auth.Clone()
 	updated, err := exec.Refresh(ctx, cloned)
 	if err != nil && errors.Is(err, context.Canceled) {
 		log.Debugf("refresh canceled for %s, %s", auth.Provider, auth.ID)
-		return
+		return err
 	}
 	log.Debugf("refreshed %s, %s, %v", auth.Provider, auth.ID, err)
 	now := time.Now()
 	if err != nil {
+		var persistSnapshot *Auth
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
 			current.NextRefreshAfter = now.Add(refreshFailureBackoff)
 			current.LastError = &Error{Message: err.Error()}
 			m.auths[id] = current
+			persistSnapshot = current.Clone()
 			if m.scheduler != nil {
 				m.scheduler.upsertAuth(current.Clone())
 			}
 		}
 		m.mu.Unlock()
-		return
+		if persistSnapshot != nil {
+			if persistErr := m.persist(ctx, persistSnapshot); persistErr != nil {
+				log.WithError(persistErr).Warnf("failed to persist refresh failure state for auth %s", id)
+			}
+		}
+		return err
 	}
 	if updated == nil {
 		updated = cloned
@@ -2923,7 +2944,23 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	updated.NextRefreshAfter = time.Time{}
 	updated.LastError = nil
 	updated.UpdatedAt = now
-	_, _ = m.Update(ctx, updated)
+	if enableOnSuccess {
+		clearAuthStateOnRefreshSuccess(updated, now)
+	}
+	_, err = m.Update(ctx, updated)
+	return err
+}
+
+func clearAuthStateOnRefreshSuccess(auth *Auth, now time.Time) {
+	if auth == nil {
+		return
+	}
+	auth.Disabled = false
+	clearAuthStateOnSuccess(auth, now)
+	auth.LocalRateLimit = LocalRateLimitState{}
+	for _, state := range auth.ModelStates {
+		resetModelState(state, now)
+	}
 }
 
 func (m *Manager) executorFor(provider string) ProviderExecutor {

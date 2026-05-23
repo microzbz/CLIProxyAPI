@@ -113,6 +113,64 @@ func TestListAuthFiles_FiltersByEnabledState(t *testing.T) {
 	}
 }
 
+type authoritativeListAuthStore struct {
+	memoryAuthStore
+}
+
+func (s *authoritativeListAuthStore) UseStoreAuthSource() bool {
+	return true
+}
+
+func TestListAuthFiles_UsesAuthoritativeStoreForDisabledAuths(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	store := &authoritativeListAuthStore{}
+	if _, err := store.Save(context.Background(), &coreauth.Auth{
+		ID:       "disabled-auth",
+		FileName: "disabled.json",
+		Provider: "codex",
+		Status:   coreauth.StatusDisabled,
+		Disabled: true,
+		Attributes: map[string]string{
+			"path": filepath.Join(authDir, "disabled.json"),
+		},
+		Metadata: map[string]any{"type": "codex"},
+	}); err != nil {
+		t.Fatalf("save disabled auth: %v", err)
+	}
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+	h.tokenStore = store
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files?enabled=false", nil)
+
+	h.ListAuthFiles(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+	var payload struct {
+		Files []map[string]any `json:"files"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(payload.Files) != 1 {
+		t.Fatalf("files len = %d, want 1; body=%s", len(payload.Files), rec.Body.String())
+	}
+	if got, _ := payload.Files[0]["name"].(string); got != "disabled.json" {
+		t.Fatalf("file name = %q, want disabled.json", got)
+	}
+	if got, _ := payload.Files[0]["disabled"].(bool); !got {
+		t.Fatalf("disabled = %v, want true", got)
+	}
+}
+
 func TestListAuthFiles_PaginatesResults(t *testing.T) {
 	t.Setenv("MANAGEMENT_PASSWORD", "")
 	gin.SetMode(gin.TestMode)
@@ -241,6 +299,64 @@ func TestListAuthFiles_IncludesRateLimitState(t *testing.T) {
 	}
 	if got, ok := payload.Files[0]["rate_limit_retry_after"].(string); !ok || strings.TrimSpace(got) == "" {
 		t.Fatalf("rate_limit_retry_after = %v, want non-empty RFC3339 string", payload.Files[0]["rate_limit_retry_after"])
+	}
+}
+
+func TestListAuthFiles_IncludesDisabledRuntimeOnlyAuthWithBackingFile(t *testing.T) {
+	t.Setenv("MANAGEMENT_PASSWORD", "")
+	gin.SetMode(gin.TestMode)
+
+	authDir := t.TempDir()
+	path := filepath.Join(authDir, "runtime.json")
+	if err := os.WriteFile(path, []byte(`{"type":"gemini-cli","refresh_token":"rt"}`), 0o600); err != nil {
+		t.Fatalf("write auth file: %v", err)
+	}
+
+	manager := coreauth.NewManager(nil, nil, nil)
+	if _, err := manager.Register(context.Background(), &coreauth.Auth{
+		ID:       "runtime-auth",
+		FileName: "runtime.json",
+		Provider: "gemini-cli",
+		Status:   coreauth.StatusDisabled,
+		Disabled: true,
+		Attributes: map[string]string{
+			"path":         path,
+			"runtime_only": "true",
+		},
+		Metadata: map[string]any{
+			"type":          "gemini-cli",
+			"refresh_token": "rt",
+		},
+	}); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
+
+	rec := httptest.NewRecorder()
+	ctx, _ := gin.CreateTestContext(rec)
+	ctx.Request = httptest.NewRequest(http.MethodGet, "/v0/management/auth-files", nil)
+
+	h.ListAuthFiles(ctx)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d; body=%s", rec.Code, http.StatusOK, rec.Body.String())
+	}
+
+	var payload struct {
+		Files []map[string]any `json:"files"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(payload.Files) != 1 {
+		t.Fatalf("files len = %d, want 1; body=%s", len(payload.Files), rec.Body.String())
+	}
+	if got, _ := payload.Files[0]["name"].(string); got != "runtime.json" {
+		t.Fatalf("file name = %q, want runtime.json", got)
+	}
+	if got, _ := payload.Files[0]["has_refresh_token"].(bool); !got {
+		t.Fatalf("has_refresh_token = %v, want true", got)
 	}
 }
 

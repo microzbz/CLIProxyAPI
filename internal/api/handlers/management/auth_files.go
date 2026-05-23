@@ -274,15 +274,19 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		return
 	}
 	searchFilter := authListSearchQuery(c)
-	if h.authManager == nil {
+	if h.authManager == nil && !h.usesAuthoritativeAuthStore() {
 		h.listAuthFilesFromDisk(c, enabledFilter)
 		return
 	}
-	auths := h.authManager.List()
+	auths, authoritativeStore, errList := h.managementAuthList(c.Request.Context())
+	if errList != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to list auth files: %v", errList)})
+		return
+	}
 	filtered := make([]*coreauth.Auth, 0, len(auths))
 	now := time.Now()
 	for _, auth := range auths {
-		if !authVisibleInListLight(auth) {
+		if !authVisibleInList(auth, authoritativeStore) {
 			continue
 		}
 		if !authMatchesProviderFilter(auth, providerFilter) || !authMatchesStateFilter(auth, stateFilter, now) {
@@ -303,7 +307,7 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 	}
 	files := make([]gin.H, 0, window.limit)
 	for _, auth := range filtered[window.start:window.end] {
-		if entry := h.buildAuthFileEntry(auth); entry != nil {
+		if entry := h.buildAuthFileEntryForList(auth, authoritativeStore); entry != nil {
 			files = append(files, entry)
 		}
 	}
@@ -397,6 +401,7 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, enabledFilter *bool) {
 					}
 				}
 				fileData["disabled"] = disabledValue
+				fileData["has_refresh_token"] = authFileJSONHasRefreshToken(data)
 				if pv := gjson.GetBytes(data, "priority"); pv.Exists() {
 					switch pv.Type {
 					case gjson.Number:
@@ -534,15 +539,30 @@ func authMatchesStateFilter(auth *coreauth.Auth, state string, now time.Time) bo
 }
 
 func authVisibleInListLight(auth *coreauth.Auth) bool {
+	return authVisibleInList(auth, false)
+}
+
+func authVisibleInList(auth *coreauth.Auth, authoritativeStore bool) bool {
 	if auth == nil {
 		return false
 	}
-	runtimeOnly := isRuntimeOnlyAuth(auth)
-	if runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled) {
-		return false
+	if authoritativeStore {
+		if strings.EqualFold(strings.TrimSpace(auth.StatusMessage), "removed via management api") {
+			return false
+		}
+		return strings.TrimSpace(auth.FileName) != "" || strings.TrimSpace(auth.ID) != ""
 	}
+	runtimeOnly := isRuntimeOnlyAuth(auth)
 	path := strings.TrimSpace(authAttribute(auth, "path"))
 	if runtimeOnly {
+		if auth.Disabled || auth.Status == coreauth.StatusDisabled {
+			if path == "" {
+				return false
+			}
+			if _, err := os.Stat(path); os.IsNotExist(err) {
+				return false
+			}
+		}
 		return true
 	}
 	if path == "" {
@@ -554,6 +574,84 @@ func authVisibleInListLight(auth *coreauth.Auth) bool {
 		}
 	}
 	return true
+}
+
+func (h *Handler) managementAuthList(ctx context.Context) ([]*coreauth.Auth, bool, error) {
+	authoritativeStore := h.usesAuthoritativeAuthStore()
+	var storeAuths []*coreauth.Auth
+	if authoritativeStore {
+		store := h.tokenStoreWithBaseDir()
+		if store == nil {
+			return nil, true, fmt.Errorf("token store unavailable")
+		}
+		auths, err := store.List(ctx)
+		if err != nil {
+			return nil, true, err
+		}
+		storeAuths = auths
+	}
+	if h.authManager == nil {
+		return cloneAuthList(storeAuths), authoritativeStore, nil
+	}
+	runtimeAuths := h.authManager.List()
+	if !authoritativeStore {
+		return runtimeAuths, false, nil
+	}
+	return mergeAuthLists(storeAuths, runtimeAuths), true, nil
+}
+
+func mergeAuthLists(storeAuths, runtimeAuths []*coreauth.Auth) []*coreauth.Auth {
+	merged := make(map[string]*coreauth.Auth, len(storeAuths)+len(runtimeAuths))
+	order := make([]string, 0, len(storeAuths)+len(runtimeAuths))
+	put := func(auth *coreauth.Auth) {
+		if auth == nil {
+			return
+		}
+		key := authListMergeKey(auth)
+		if key == "" {
+			return
+		}
+		if _, exists := merged[key]; !exists {
+			order = append(order, key)
+		}
+		merged[key] = auth.Clone()
+	}
+	for _, auth := range storeAuths {
+		put(auth)
+	}
+	for _, auth := range runtimeAuths {
+		put(auth)
+	}
+	out := make([]*coreauth.Auth, 0, len(order))
+	for _, key := range order {
+		if auth := merged[key]; auth != nil {
+			out = append(out, auth)
+		}
+	}
+	return out
+}
+
+func cloneAuthList(auths []*coreauth.Auth) []*coreauth.Auth {
+	out := make([]*coreauth.Auth, 0, len(auths))
+	for _, auth := range auths {
+		if auth != nil {
+			out = append(out, auth.Clone())
+		}
+	}
+	return out
+}
+
+func authListMergeKey(auth *coreauth.Auth) string {
+	if auth == nil {
+		return ""
+	}
+	if id := strings.TrimSpace(auth.ID); id != "" {
+		return "id:" + id
+	}
+	if name := strings.TrimSpace(auth.FileName); name != "" {
+		return "name:" + strings.ToLower(name)
+	}
+	return ""
 }
 
 func authListSearchQuery(c *gin.Context) string {
@@ -841,15 +939,24 @@ func parsePaginationInt(raw, field string, min int, allowZero bool) (int, error)
 }
 
 func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
+	return h.buildAuthFileEntryForList(auth, false)
+}
+
+func (h *Handler) buildAuthFileEntryForList(auth *coreauth.Auth, authoritativeStore bool) gin.H {
 	if auth == nil {
 		return nil
 	}
 	auth.EnsureIndex()
 	runtimeOnly := isRuntimeOnlyAuth(auth)
-	if runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled) {
-		return nil
-	}
 	path := strings.TrimSpace(authAttribute(auth, "path"))
+	if !authoritativeStore && runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled) {
+		if path == "" {
+			return nil
+		}
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			return nil
+		}
+	}
 	if path == "" && !runtimeOnly {
 		return nil
 	}
@@ -858,19 +965,20 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 		name = auth.ID
 	}
 	entry := gin.H{
-		"id":             auth.ID,
-		"auth_index":     auth.Index,
-		"name":           name,
-		"type":           strings.TrimSpace(auth.Provider),
-		"provider":       strings.TrimSpace(auth.Provider),
-		"label":          auth.Label,
-		"status":         auth.Status,
-		"status_message": auth.StatusMessage,
-		"disabled":       auth.Disabled,
-		"unavailable":    auth.Unavailable,
-		"runtime_only":   runtimeOnly,
-		"source":         "memory",
-		"size":           int64(0),
+		"id":                auth.ID,
+		"auth_index":        auth.Index,
+		"name":              name,
+		"type":              strings.TrimSpace(auth.Provider),
+		"provider":          strings.TrimSpace(auth.Provider),
+		"label":             auth.Label,
+		"status":            auth.Status,
+		"status_message":    auth.StatusMessage,
+		"disabled":          auth.Disabled,
+		"unavailable":       auth.Unavailable,
+		"runtime_only":      runtimeOnly,
+		"source":            "memory",
+		"size":              int64(0),
+		"has_refresh_token": authHasRefreshToken(auth),
 	}
 	if email := authEmail(auth); email != "" {
 		entry["email"] = email
@@ -904,7 +1012,7 @@ func (h *Handler) buildAuthFileEntry(auth *coreauth.Auth) gin.H {
 			entry["modtime"] = info.ModTime()
 		} else if os.IsNotExist(err) {
 			// Hide credentials removed from disk but still lingering in memory.
-			if !runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled || strings.EqualFold(strings.TrimSpace(auth.StatusMessage), "removed via management api")) {
+			if !authoritativeStore && !runtimeOnly && (auth.Disabled || auth.Status == coreauth.StatusDisabled || strings.EqualFold(strings.TrimSpace(auth.StatusMessage), "removed via management api")) {
 				return nil
 			}
 			entry["source"] = "memory"
@@ -1026,6 +1134,46 @@ func authAttribute(auth *coreauth.Auth, key string) string {
 		return ""
 	}
 	return auth.Attributes[key]
+}
+
+func authHasRefreshToken(auth *coreauth.Auth) bool {
+	if auth == nil {
+		return false
+	}
+	for _, source := range []map[string]string{auth.Attributes} {
+		for _, key := range []string{"refresh_token", "refreshToken", "rt"} {
+			if strings.TrimSpace(source[key]) != "" {
+				return true
+			}
+		}
+	}
+	return mapHasRefreshToken(auth.Metadata)
+}
+
+func mapHasRefreshToken(values map[string]any) bool {
+	if len(values) == 0 {
+		return false
+	}
+	for _, key := range []string{"refresh_token", "refreshToken", "rt"} {
+		if raw, ok := values[key]; ok && raw != nil && strings.TrimSpace(fmt.Sprint(raw)) != "" {
+			return true
+		}
+	}
+	for _, key := range []string{"token", "token_data", "tokenData"} {
+		if nested, ok := values[key].(map[string]any); ok && mapHasRefreshToken(nested) {
+			return true
+		}
+	}
+	return false
+}
+
+func authFileJSONHasRefreshToken(data []byte) bool {
+	for _, path := range []string{"refresh_token", "refreshToken", "rt", "token.refresh_token", "token.refreshToken", "token.rt", "token_data.refresh_token", "tokenData.refreshToken"} {
+		if v := gjson.GetBytes(data, path); v.Exists() && strings.TrimSpace(v.String()) != "" {
+			return true
+		}
+	}
+	return false
 }
 
 func isRuntimeOnlyAuth(auth *coreauth.Auth) bool {
@@ -2006,7 +2154,7 @@ func collectAuthModelIDsForReset(auth *coreauth.Auth) []string {
 	return modelIDs
 }
 
-// PatchAuthFileFields updates editable fields (prefix, proxy_url, priority, note) of an auth file.
+// PatchAuthFileFields updates editable fields of an auth file.
 func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	if h.authManager == nil {
 		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
@@ -2014,11 +2162,13 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 	}
 
 	var req struct {
-		Name     string  `json:"name"`
-		Prefix   *string `json:"prefix"`
-		ProxyURL *string `json:"proxy_url"`
-		Priority *int    `json:"priority"`
-		Note     *string `json:"note"`
+		Name             string  `json:"name"`
+		Prefix           *string `json:"prefix"`
+		ProxyURL         *string `json:"proxy_url"`
+		Priority         *int    `json:"priority"`
+		Note             *string `json:"note"`
+		AccessToken      *string `json:"access_token"`
+		AccessTokenCamel *string `json:"accessToken"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
@@ -2033,20 +2183,7 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 
 	ctx := c.Request.Context()
 
-	// Find auth by name or ID
-	var targetAuth *coreauth.Auth
-	if auth, ok := h.authManager.GetByID(name); ok {
-		targetAuth = auth
-	} else {
-		auths := h.authManager.List()
-		for _, auth := range auths {
-			if auth.FileName == name {
-				targetAuth = auth
-				break
-			}
-		}
-	}
-
+	targetAuth := h.findManagementAuthByNameOrID(ctx, name)
 	if targetAuth == nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
 		return
@@ -2090,6 +2227,16 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		}
 		changed = true
 	}
+	if req.AccessToken != nil || req.AccessTokenCamel != nil {
+		value := ""
+		if req.AccessToken != nil {
+			value = *req.AccessToken
+		} else if req.AccessTokenCamel != nil {
+			value = *req.AccessTokenCamel
+		}
+		applyAuthAccessTokenField(targetAuth, value)
+		changed = true
+	}
 
 	if !changed {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "no fields to update"})
@@ -2098,13 +2245,163 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 
 	targetAuth.UpdatedAt = time.Now()
 
-	if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
-		return
+	if h.usesAuthoritativeAuthStore() {
+		if _, err := h.saveTokenRecord(ctx, targetAuth); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
+			return
+		}
+	} else {
+		if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
+			return
+		}
+		h.notifyRuntimeAuthChanged(ctx, targetAuth)
 	}
-	h.notifyRuntimeAuthChanged(ctx, targetAuth)
 
 	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+func (h *Handler) findManagementAuthByNameOrID(ctx context.Context, name string) *coreauth.Auth {
+	name = strings.TrimSpace(name)
+	if h == nil || name == "" {
+		return nil
+	}
+	if h.authManager != nil {
+		if auth, ok := h.authManager.GetByID(name); ok {
+			return auth
+		}
+		for _, auth := range h.authManager.List() {
+			if auth != nil && auth.FileName == name {
+				return auth
+			}
+		}
+	}
+	if !h.usesAuthoritativeAuthStore() {
+		return nil
+	}
+	store := h.tokenStoreWithBaseDir()
+	if store == nil {
+		return nil
+	}
+	auths, err := store.List(ctx)
+	if err != nil {
+		log.WithError(err).Warn("failed to list authoritative auth store")
+		return nil
+	}
+	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		if auth.ID == name || auth.FileName == name {
+			return auth.Clone()
+		}
+	}
+	return nil
+}
+
+func applyAuthAccessTokenField(auth *coreauth.Auth, value string) {
+	if auth == nil {
+		return
+	}
+	if auth.Metadata == nil {
+		auth.Metadata = make(map[string]any)
+	}
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		delete(auth.Metadata, "access_token")
+		delete(auth.Metadata, "accessToken")
+		if token, ok := auth.Metadata["token"].(map[string]any); ok {
+			delete(token, "access_token")
+			delete(token, "accessToken")
+		}
+		return
+	}
+	auth.Metadata["access_token"] = trimmed
+	if token, ok := auth.Metadata["token"].(map[string]any); ok {
+		token["access_token"] = trimmed
+	}
+}
+
+// RefreshAuthFiles refreshes selected auth records that contain a refresh token.
+func (h *Handler) RefreshAuthFiles(c *gin.Context) {
+	if h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+
+	var req struct {
+		Name  string   `json:"name"`
+		Names []string `json:"names"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	names := normalizeAuthStatusPatchNames(req.Name, req.Names)
+	if len(names) == 0 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name or names is required"})
+		return
+	}
+
+	ctx := c.Request.Context()
+	refreshed := make([]string, 0, len(names))
+	notFound := make([]string, 0)
+	skipped := make([]string, 0)
+	failed := make(map[string]string)
+
+	for _, name := range names {
+		targetAuth := h.findAuthByNameOrID(name)
+		if targetAuth == nil {
+			notFound = append(notFound, name)
+			continue
+		}
+
+		displayName := authListName(targetAuth)
+		if displayName == "" {
+			displayName = name
+		}
+		if !authHasRefreshToken(targetAuth) {
+			skipped = append(skipped, displayName)
+			continue
+		}
+
+		affectedModelIDs := collectAuthModelIDsForReset(targetAuth)
+		if err := h.authManager.RefreshAuth(ctx, targetAuth.ID); err != nil {
+			failed[displayName] = err.Error()
+			continue
+		}
+
+		if updatedAuth := h.findAuthByNameOrID(targetAuth.ID); updatedAuth != nil {
+			h.notifyRuntimeAuthChanged(ctx, updatedAuth)
+			reg := registry.GetGlobalRegistry()
+			for _, modelID := range affectedModelIDs {
+				reg.ClearModelQuotaExceeded(updatedAuth.ID, modelID)
+				reg.ResumeClientModel(updatedAuth.ID, modelID)
+			}
+		}
+		refreshed = append(refreshed, displayName)
+	}
+
+	body := gin.H{
+		"status":    "ok",
+		"refreshed": len(refreshed),
+		"names":     refreshed,
+	}
+	if len(notFound) > 0 {
+		body["not_found"] = notFound
+	}
+	if len(skipped) > 0 {
+		body["skipped"] = skipped
+	}
+	if len(failed) > 0 {
+		body["failed"] = failed
+	}
+	if len(notFound) > 0 || len(skipped) > 0 || len(failed) > 0 {
+		c.JSON(http.StatusMultiStatus, body)
+		return
+	}
+	c.JSON(http.StatusOK, body)
 }
 
 func (h *Handler) disableAuth(ctx context.Context, id string) {

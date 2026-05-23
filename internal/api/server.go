@@ -656,6 +656,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/auth-files/download", s.mgmt.DownloadAuthFile)
 		mgmt.POST("/auth-files", s.mgmt.UploadAuthFile)
 		mgmt.DELETE("/auth-files", s.mgmt.DeleteAuthFile)
+		mgmt.POST("/auth-files/refresh", s.mgmt.RefreshAuthFiles)
 		mgmt.PATCH("/auth-files/status", s.mgmt.PatchAuthFileStatus)
 		mgmt.PATCH("/auth-files/fields", s.mgmt.PatchAuthFileFields)
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
@@ -766,7 +767,118 @@ func patchManagementControlPanelHTML(data []byte) []byte {
 	for _, replacement := range replacements {
 		html = strings.ReplaceAll(html, replacement[0], replacement[1])
 	}
+	html = injectAuthRefreshSelectionHTML(html)
+	html = injectAuthAccessTokenEditorHTML(html)
 	return []byte(html)
+}
+
+func injectAuthRefreshSelectionHTML(html string) string {
+	if strings.Contains(html, "cpa-auth-refresh-native-selected-v3") || !strings.Contains(html, "</body>") {
+		return html
+	}
+	const patch = `<style>
+.cpa-auth-refresh-select{width:16px;height:16px;margin:0 8px 0 0;vertical-align:middle;accent-color:var(--primary-color,#8b8680)}
+.cpa-auth-refresh-note{margin-left:8px;font-size:12px;color:var(--text-secondary,#6d6760)}
+.cpa-auth-refresh-note[data-tone=success]{color:var(--success-badge-text,#065f46)}
+.cpa-auth-refresh-note[data-tone=error]{color:var(--failure-badge-text,#991b1b)}
+.cpa-auth-refresh-bulk-button{white-space:nowrap}
+</style>
+<script>
+(function(){
+  const PATCH_MARKER="cpa-auth-refresh-native-selected-v3";
+  const TOP_BUTTON_ID="cpa-auth-refresh-selected";
+  const BULK_BUTTON_ID="cpa-auth-refresh-selected-bulk";
+  const NOTE_ID="cpa-auth-refresh-selected-note";
+  const BULK_NOTE_ID="cpa-auth-refresh-selected-bulk-note";
+  const SELECT_CLASS="cpa-auth-refresh-select";
+  const LIST_ENDPOINT="/v0/management/auth-files?page=1&page_size=2000";
+  const REFRESH_ENDPOINT="/v0/management/auth-files/refresh";
+  const isZh=(document.documentElement.lang||navigator.language||"").toLowerCase().startsWith("zh");
+  const text=isZh?{button:"刷新Token",topButton:"刷新选中Token",working:"正在刷新Token...",empty:"请选择带 RT 的Token",success:"已刷新选中Token",failed:"刷新Token失败",refresh:"刷新",select:"选择刷新",download:"下载选中"}:{button:"Refresh Token",topButton:"Refresh Selected Tokens",working:"Refreshing tokens...",empty:"Select tokens with RT first",success:"Selected tokens refreshed",failed:"Failed to refresh tokens",refresh:"Refresh",select:"Select for refresh",download:"Download Selected"};
+  let timer=null;
+  let inFlight=null;
+  let started=false;
+  let authMap=new Map();
+  const selected=new Set();
+  document.documentElement.setAttribute("data-cpa-auth-refresh-patch",PATCH_MARKER);
+  function norm(value){const raw=String(value||"").trim();const m=raw.match(/^Bearer\s+(.+)$/i);return m?m[1].trim():raw}
+  function storage(storage,key){try{return storage&&storage.getItem?storage.getItem(key):""}catch(_){return ""}}
+  function key(){return norm(window.__CPA_AUTH_RATE_LIMIT_MANAGEMENT_KEY__)||norm(storage(localStorage,"managementKey"))||norm(storage(sessionStorage,"managementKey"))||norm(storage(sessionStorage,"cpaAuthRateLimitManagementKey"))||norm(storage(localStorage,"cpaAuthRateLimitManagementKey"))}
+  function headers(extra){const h=new Headers(extra||{});const k=key();if(k&&!h.has("Authorization"))h.set("Authorization","Bearer "+k);return h}
+  function page(){return /^#?\/auth-files(?:$|\/)/.test(String(location.hash||"#/").replace(/^#/,""))}
+  function clean(value){return String(value||"").replace(/\s+/g," ").trim()}
+  function refreshButton(){return Array.prototype.find.call(document.querySelectorAll("button"),function(button){return button.id!==TOP_BUTTON_ID&&button.id!==BULK_BUTTON_ID&&!button.closest("[role=dialog]")&&button.classList.contains("btn")&&clean(button.textContent)===text.refresh})}
+  function nameNodes(){return Array.prototype.filter.call(document.querySelectorAll("span[title]"),function(node){const title=String(node.getAttribute("title")||"").trim();return /\.json$/i.test(title)&&!node.closest("[role=dialog]")})}
+  function note(message,tone){[NOTE_ID,BULK_NOTE_ID].forEach(function(id){const n=document.getElementById(id);if(!n)return;n.textContent=message||"";n.dataset.tone=tone||"muted"})}
+  function nativeSelected(node){let el=node.parentElement;for(let depth=0;el&&el!==document.body&&depth<8;depth++,el=el.parentElement){if(el.getAttribute("aria-selected")==="true"||el.getAttribute("data-selected")==="true")return true;const controls=el.querySelectorAll('input[type="checkbox"],[role="checkbox"],[aria-checked],[data-state="checked"]');for(let i=0;i<controls.length;i++){const c=controls[i];if(c.classList&&c.classList.contains(SELECT_CLASS))continue;const label=clean(c.getAttribute("aria-label")||c.getAttribute("title")||"");const cls=String(c.className||"");const looksLikeRowSelect=/SelectionCheckbox|row.*select|select.*row/i.test(cls)||/^(选择|Select)$/i.test(label);if(!looksLikeRowSelect)continue;const aria=String(c.getAttribute("aria-checked")||"").toLowerCase();const state=String(c.getAttribute("data-state")||"").toLowerCase();if(c.checked||aria==="true"||state==="checked")return true}}return false}
+  function nativeSelectedCount(){const match=clean(document.body&&document.body.textContent).match(/已选\s*(\d+)\s*项|Selected\s*(\d+)/i);return match?Number(match[1]||match[2]||0):0}
+  function selectedRefreshNames(){const out=[];const seen=new Set();const nodes=nameNodes();const selectedCount=nativeSelectedCount();nodes.forEach(function(node){const name=String(node.getAttribute("title")||"").trim();const info=authMap.get(name);if(info&&info.has_refresh_token===false)return;if(!selected.has(name)&&!nativeSelected(node))return;if(seen.has(name))return;seen.add(name);out.push(name)});if(out.length===0&&selectedCount>0){nodes.forEach(function(node){const name=String(node.getAttribute("title")||"").trim();const info=authMap.get(name);if(info&&info.has_refresh_token===false)return;if(seen.has(name))return;seen.add(name);out.push(name)})}return out}
+  function selectionBar(){const candidates=[];Array.prototype.forEach.call(document.querySelectorAll("body *"),function(el){if(el.closest("[role=dialog]"))return;const value=clean(el.textContent);if(!/(已选\s*\d+\s*项|Selected\s*\d+)/i.test(value))return;if(!el.querySelector("button"))return;if(!/(下载选中|Download Selected|Enable|Disable|Delete|启用|禁用|删除)/i.test(value))return;candidates.push(el)});candidates.sort(function(a,b){return clean(a.textContent).length-clean(b.textContent).length});return candidates[0]||null}
+  function downloadButton(bar){if(!bar)return null;return Array.prototype.find.call(bar.querySelectorAll("button"),function(button){return clean(button.textContent)===text.download||/^(下载选中|Download Selected)$/i.test(clean(button.textContent))})}
+  function allButtons(){return [document.getElementById(TOP_BUTTON_ID),document.getElementById(BULK_BUTTON_ID)].filter(Boolean)}
+  function bindButton(button){if(!button||button.dataset.cpaNativeSelectedRefresh==="true")return;button.addEventListener("click",function(event){event.preventDefault();event.stopImmediatePropagation();refreshSelected()},true);button.dataset.cpaNativeSelectedRefresh="true"}
+  function updateButton(){const names=selectedRefreshNames();const nativeCount=nativeSelectedCount();const labelCount=nativeCount>0?nativeCount:names.length;allButtons().forEach(function(b){b.disabled=names.length===0;b.textContent=labelCount>0?(b.id===BULK_BUTTON_ID?text.button:text.topButton)+" ("+labelCount+")":(b.id===BULK_BUTTON_ID?text.button:text.topButton)})}
+  function ensureNote(parent,after,id){if(!parent||!after)return;let n=document.getElementById(id);if(!n){n=document.createElement("span");n.id=id;n.className="cpa-auth-refresh-note";n.dataset.tone="muted"}if(n.parentNode!==parent)parent.insertBefore(n,after.nextSibling)}
+  function ensureTopButton(){const r=refreshButton();if(!r||!r.parentNode)return;let b=document.getElementById(TOP_BUTTON_ID);if(!b){b=document.createElement("button");b.type="button";b.id=TOP_BUTTON_ID;b.className="btn btn-secondary btn-sm";b.textContent=text.topButton}bindButton(b);if(b.parentNode!==r.parentNode)r.parentNode.insertBefore(b,r.nextSibling);ensureNote(r.parentNode,b,NOTE_ID)}
+  function ensureBulkButton(){const bar=selectionBar();if(!bar)return;const d=downloadButton(bar);const parent=d&&d.parentNode?d.parentNode:bar;let b=document.getElementById(BULK_BUTTON_ID);if(!b){b=document.createElement("button");b.type="button";b.id=BULK_BUTTON_ID;b.className=(d&&d.className?d.className:"btn btn-secondary btn-sm")+" cpa-auth-refresh-bulk-button";b.textContent=text.button}bindButton(b);if(b.parentNode!==parent){if(d&&d.parentNode===parent)parent.insertBefore(b,d);else parent.appendChild(b)}ensureNote(parent,b,BULK_NOTE_ID)}
+  function ensureButton(){if(!page())return;ensureTopButton();ensureBulkButton();updateButton()}
+  function syncSelectors(){nameNodes().forEach(function(node){const name=String(node.getAttribute("title")||"").trim();const info=authMap.get(name);const parent=node.parentElement;if(!parent)return;let box=Array.prototype.find.call(parent.querySelectorAll(":scope > ."+SELECT_CLASS),function(input){return input.getAttribute("data-auth-name")===name});if(!info||!info.has_refresh_token){selected.delete(name);if(box)box.remove();return}if(!box){box=document.createElement("input");box.type="checkbox";box.className=SELECT_CLASS;box.setAttribute("data-auth-name",name);box.setAttribute("aria-label",text.select+" "+name);box.addEventListener("change",function(){box.checked?selected.add(name):selected.delete(name);updateButton()});parent.insertBefore(box,node)}box.checked=selected.has(name)});updateButton()}
+  async function loadAuths(){if(!page()||inFlight)return inFlight;inFlight=(async function(){try{const res=await fetch(LIST_ENDPOINT,{headers:headers(),cache:"no-store"});const payload=await res.json().catch(function(){return {}});if(!res.ok)throw new Error(payload.error||payload.message||res.statusText||"request failed");const next=new Map();(Array.isArray(payload.files)?payload.files:[]).forEach(function(file){const name=String(file&&(file.name||file.id)||"").trim();if(name)next.set(name,file)});authMap=next;syncSelectors()}catch(_){}finally{inFlight=null}})();return inFlight}
+  async function refreshSelected(){const names=selectedRefreshNames();if(names.length===0){note(text.empty,"muted");updateButton();return}allButtons().forEach(function(b){b.disabled=true;b.textContent=text.working});try{const res=await fetch(REFRESH_ENDPOINT,{method:"POST",headers:headers({"Content-Type":"application/json"}),body:JSON.stringify({names:names})});const payload=await res.json().catch(function(){return {}});if(!res.ok)throw new Error(payload.error||payload.message||res.statusText||"request failed");selected.clear();note(text.success+"："+Number(payload.refreshed||0),payload.failed?"error":"success");const r=refreshButton();if(r)r.click();setTimeout(schedule,250)}catch(err){note(text.failed+": "+(err&&err.message?err.message:String(err||"")),"error")}finally{updateButton()}}
+  function schedule(){if(timer)clearTimeout(timer);timer=setTimeout(function(){timer=null;if(!page())return;ensureButton();syncSelectors();loadAuths()},120)}
+  function init(){if(started)return;started=true;window.addEventListener("hashchange",schedule);document.addEventListener("click",schedule,true);new MutationObserver(schedule).observe(document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:["class","style","hidden","aria-hidden","open"]});schedule()}
+  if(document.readyState==="loading")document.addEventListener("DOMContentLoaded",init,{once:true});
+  init();
+})();
+</script>`
+	return strings.Replace(html, "</body>", patch+"\n</body>", 1)
+}
+
+func injectAuthAccessTokenEditorHTML(html string) string {
+	if strings.Contains(html, "cpa-auth-access-token-editor-v3") || !strings.Contains(html, "</body>") {
+		return html
+	}
+	const patch = `<script>
+(function(){
+  const PATCH_MARKER="cpa-auth-access-token-editor-v3";
+  const ENDPOINT="/v0/management/auth-files/fields";
+  const EDITOR_CLASS="cpa-auth-access-token-json-editor";
+  const originalByTextarea=new WeakMap();
+  const editorBySource=new WeakMap();
+  const dirtyEditors=new WeakSet();
+  let lastAugmentedAt=0;
+  document.documentElement.setAttribute("data-cpa-auth-access-token-editor",PATCH_MARKER);
+  function clean(value){return String(value||"").replace(/\s+/g," ").trim()}
+  function norm(value){const raw=String(value||"").trim();const m=raw.match(/^Bearer\s+(.+)$/i);return m?m[1].trim():raw}
+  function storage(storage,key){try{return storage&&storage.getItem?storage.getItem(key):""}catch(_){return ""}}
+  function key(){return norm(window.__CPA_AUTH_RATE_LIMIT_MANAGEMENT_KEY__)||norm(storage(localStorage,"managementKey"))||norm(storage(sessionStorage,"managementKey"))||norm(storage(sessionStorage,"cpaAuthRateLimitManagementKey"))||norm(storage(localStorage,"cpaAuthRateLimitManagementKey"))}
+  function headers(extra){const h=new Headers(extra||{});const k=key();if(k&&!h.has("Authorization"))h.set("Authorization","Bearer "+k);return h}
+  function fieldsURL(url){try{return new URL(String(url),location.origin).pathname===ENDPOINT}catch(_){return String(url||"").indexOf(ENDPOINT)>=0}}
+  function dialog(){const nodes=Array.prototype.slice.call(document.querySelectorAll('[role="dialog"],body *'));const matched=nodes.filter(function(el){if(el.closest('[role="dialog"]')&&el.getAttribute("role")!=="dialog")return false;const value=clean(el.textContent);return /认证文件详情\s*\/\s*编辑|Auth File.*Edit|Auth File.*Details/i.test(value)&&/access_token|accessToken|认证文件 JSON/i.test(value)});matched.sort(function(a,b){return clean(a.textContent).length-clean(b.textContent).length});return matched[0]||null}
+  function tokenValueFromObject(obj){if(!obj||typeof obj!=="object"||Array.isArray(obj))return {exists:false,value:""};if(Object.prototype.hasOwnProperty.call(obj,"access_token"))return {exists:true,value:String(obj.access_token||"")};if(Object.prototype.hasOwnProperty.call(obj,"accessToken"))return {exists:true,value:String(obj.accessToken||"")};if(obj.token&&typeof obj.token==="object"){if(Object.prototype.hasOwnProperty.call(obj.token,"access_token"))return {exists:true,value:String(obj.token.access_token||"")};if(Object.prototype.hasOwnProperty.call(obj.token,"accessToken"))return {exists:true,value:String(obj.token.accessToken||"")}}return {exists:false,value:""}}
+  function unlockArea(area){if(!area)return;area.readOnly=false;area.disabled=false;area.removeAttribute("readonly");area.removeAttribute("disabled");area.setAttribute("aria-readonly","false");if(area.tabIndex<0)area.tabIndex=0;area.style.pointerEvents="auto";area.style.userSelect="text";area.style.webkitUserSelect="text";area.style.cursor="text"}
+  function parseTokenFromArea(area){try{const parsed=JSON.parse(area.value||"{}");const token=tokenValueFromObject(parsed);if(token.exists){token.textarea=area;return token}}catch(_){}return {exists:false,value:""}}
+  function copyEditorStyle(source,editor){editor.className=(source.className?source.className+" ":"")+EDITOR_CLASS;editor.rows=source.rows||12;editor.wrap=source.wrap||"off";editor.spellcheck=false;editor.autocomplete="off";editor.style.cssText=source.style.cssText||"";editor.style.display="block";editor.style.boxSizing="border-box";editor.style.width="100%";editor.style.minHeight=(source.offsetHeight&&source.offsetHeight>80?source.offsetHeight:220)+"px";editor.style.fontFamily=window.getComputedStyle(source).fontFamily||"monospace";editor.style.fontSize=window.getComputedStyle(source).fontSize||"12px";editor.style.lineHeight=window.getComputedStyle(source).lineHeight||"1.45";editor.style.whiteSpace="pre";editor.style.resize="vertical"}
+  function ensureEditor(){const d=dialog();if(!d)return null;const existing=Array.prototype.find.call(d.querySelectorAll("textarea."+EDITOR_CLASS),function(area){return parseTokenFromArea(area).exists});if(existing){unlockArea(existing);return existing}const areas=Array.prototype.slice.call(d.querySelectorAll("textarea")).filter(function(area){return !area.classList.contains(EDITOR_CLASS)});for(let i=0;i<areas.length;i++){const source=areas[i];const token=parseTokenFromArea(source);if(!token.exists)continue;unlockArea(source);let editor=editorBySource.get(source);if(!editor||!editor.isConnected){editor=document.createElement("textarea");editorBySource.set(source,editor);copyEditorStyle(source,editor);editor.value=source.value||"";editor.addEventListener("input",function(){dirtyEditors.add(editor);updateSaveButton()},true);source.parentNode.insertBefore(editor,source.nextSibling)}else if(!dirtyEditors.has(editor)&&editor.value!==source.value){editor.value=source.value||""}if(!originalByTextarea.has(editor))originalByTextarea.set(editor,token.value);source.style.display="none";unlockArea(editor);return editor}return null}
+  function currentToken(){const editor=ensureEditor();if(editor){const token=parseTokenFromArea(editor);if(token.exists){if(!originalByTextarea.has(editor))originalByTextarea.set(editor,token.value);token.textarea=editor;return token}}const d=dialog();if(!d)return {exists:false,value:""};const areas=Array.prototype.slice.call(d.querySelectorAll("textarea"));for(let i=0;i<areas.length;i++){unlockArea(areas[i]);const token=parseTokenFromArea(areas[i]);if(token.exists){if(!originalByTextarea.has(areas[i]))originalByTextarea.set(areas[i],token.value);return token}}return {exists:false,value:""}}
+  function tokenChanged(){const token=currentToken();if(!token.exists||!token.textarea)return false;return String(originalByTextarea.get(token.textarea)||"")!==String(token.value||"")}
+  function authName(){const d=dialog();if(!d)return "";const text=clean(d.textContent);let m=text.match(/(?:编辑|Edit|Details)\s*-\s*([^\\s]+\.json)/i);if(m&&m[1])return m[1];m=text.match(/([A-Za-z0-9_.+@-]+\.json)/);return m&&m[1]?m[1]:""}
+  function saveButton(){const d=dialog();if(!d)return null;return Array.prototype.find.call(d.querySelectorAll("button"),function(b){return /^(保存|Save)$/i.test(clean(b.textContent))})}
+  function markSaved(){const token=currentToken();if(token.exists&&token.textarea)originalByTextarea.set(token.textarea,token.value)}
+  function updateSaveButton(){if(!tokenChanged())return;const b=saveButton();if(b)b.disabled=false}
+  function augmentBody(body){let raw=body;if(body instanceof URLSearchParams)return body;if(body&&typeof body!=="string"){try{raw=String(body)}catch(_){return body}}let obj;try{obj=JSON.parse(String(raw||"{}"))}catch(_){return body}const token=currentToken();if(!token.exists)return body;obj.access_token=token.value;lastAugmentedAt=Date.now();return JSON.stringify(obj)}
+  if(typeof window.fetch==="function"&&!window.__CPA_AUTH_ACCESS_TOKEN_FETCH_PATCHED__){window.__CPA_AUTH_ACCESS_TOKEN_FETCH_PATCHED__=true;const originalFetch=window.fetch;window.fetch=function(input,init){try{const url=typeof input==="string"?input:(input&&input.url)||"";const method=String((init&&init.method)||(input&&input.method)||"GET").toUpperCase();if(method==="PATCH"&&fieldsURL(url)){if(init&&Object.prototype.hasOwnProperty.call(init,"body")){init=Object.assign({},init,{body:augmentBody(init.body)})}else if(input instanceof Request){const cloned=input.clone();return cloned.text().then(function(body){const next=new Request(input,{body:augmentBody(body)});return originalFetch.call(this,next,init)}.bind(this))}}}catch(_){}return originalFetch.apply(this,arguments)}}
+  if(window.XMLHttpRequest&&!window.__CPA_AUTH_ACCESS_TOKEN_XHR_PATCHED__){window.__CPA_AUTH_ACCESS_TOKEN_XHR_PATCHED__=true;const proto=window.XMLHttpRequest.prototype;const open=proto.open;const send=proto.send;proto.open=function(method,url){this.__cpaAuthFieldsPatch=String(method||"").toUpperCase()==="PATCH"&&fieldsURL(url);return open.apply(this,arguments)};proto.send=function(body){if(this.__cpaAuthFieldsPatch)body=augmentBody(body);return send.call(this,body)}}
+  async function fallbackSave(){const token=currentToken();const name=authName();if(!token.exists||!tokenChanged()||!name)return;const response=await fetch(ENDPOINT,{method:"PATCH",headers:headers({"Content-Type":"application/json"}),body:JSON.stringify({name:name,access_token:token.value})});if(!response.ok){const payload=await response.json().catch(function(){return {}});throw new Error(payload.error||payload.message||response.statusText||"request failed")}markSaved()}
+  document.addEventListener("input",function(event){if(event.target&&event.target.tagName==="TEXTAREA"){dirtyEditors.add(event.target);setTimeout(updateSaveButton,0)}},true);
+  document.addEventListener("click",function(event){const b=event.target&&event.target.closest?event.target.closest("button"):null;if(!b||b!==saveButton()||!tokenChanged())return;const started=Date.now();setTimeout(function(){if(lastAugmentedAt>=started){markSaved();return}fallbackSave().then(function(){const btn=saveButton();if(btn){const old=btn.textContent;btn.textContent="已保存";setTimeout(function(){btn.textContent=old},1000)}}).catch(function(err){const btn=saveButton();if(btn)btn.textContent="保存失败";console.error(err)})},250)},true);
+  function scheduleEditorSync(){setTimeout(function(){ensureEditor();updateSaveButton()},0)}
+  document.addEventListener("click",scheduleEditorSync,true);
+  new MutationObserver(scheduleEditorSync).observe(document.documentElement,{childList:true,subtree:true,attributes:true,attributeFilter:["disabled","readonly","class","style","hidden","aria-hidden"]});
+  scheduleEditorSync();
+})();
+</script>`
+	return strings.Replace(html, "</body>", patch+"\n</body>", 1)
 }
 
 func (s *Server) enableKeepAlive(timeout time.Duration, onTimeout func()) {
