@@ -292,12 +292,6 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 		return "", fmt.Errorf("postgres store: missing file path attribute for %s", auth.ID)
 	}
 
-	if auth.Disabled {
-		if _, statErr := os.Stat(path); errors.Is(statErr, fs.ErrNotExist) {
-			return "", nil
-		}
-	}
-
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
