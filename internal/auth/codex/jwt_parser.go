@@ -95,8 +95,30 @@ func (c *JWTClaims) GetUserEmail() string {
 	return c.Email
 }
 
-// GetAccountID extracts the user's account ID (subject) from the JWT claims.
-// It retrieves the unique identifier for the user's ChatGPT account.
+// GetAccountID extracts the ChatGPT account/workspace identifier from JWT claims.
+// Recent Codex tokens may omit chatgpt_account_id, so fall back to the default
+// organization and finally the user identifier to keep external token imports usable.
 func (c *JWTClaims) GetAccountID() string {
-	return c.CodexAuthInfo.ChatgptAccountID
+	if c == nil {
+		return ""
+	}
+	if accountID := strings.TrimSpace(c.CodexAuthInfo.ChatgptAccountID); accountID != "" {
+		return accountID
+	}
+	for _, org := range c.CodexAuthInfo.Organizations {
+		if org.IsDefault {
+			if id := strings.TrimSpace(org.ID); id != "" {
+				return id
+			}
+		}
+	}
+	for _, org := range c.CodexAuthInfo.Organizations {
+		if id := strings.TrimSpace(org.ID); id != "" {
+			return id
+		}
+	}
+	if userID := strings.TrimSpace(c.CodexAuthInfo.ChatgptUserID); userID != "" {
+		return userID
+	}
+	return strings.TrimSpace(c.CodexAuthInfo.UserID)
 }

@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
@@ -193,6 +194,7 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 	if err = json.Unmarshal(data, &metadata); err != nil {
 		return nil, fmt.Errorf("unmarshal auth json: %w", err)
 	}
+	codexauth.NormalizeAuthMetadata(metadata)
 	provider, _ := metadata["type"].(string)
 	if provider == "" {
 		provider = "unknown"

@@ -132,6 +132,7 @@ func (s *PostgresStore) loadPersistedAuthForMetadata(ctx context.Context, relID 
 	if err != nil {
 		return nil, err
 	}
+	codexauth.NormalizeAuthMetadata(metadata)
 	newProvider := strings.TrimSpace(valueAsString(metadata["type"]))
 	if newProvider != "" && auth != nil && strings.TrimSpace(auth.Provider) != "" && !strings.EqualFold(strings.TrimSpace(auth.Provider), newProvider) {
 		return defaultAuthFromMetadata(relID, "", metadata, time.Time{}, time.Time{}), nil
@@ -229,6 +230,7 @@ func buildAuthFromMetadataAndState(relID, path string, metadata map[string]any, 
 }
 
 func defaultAuthFromMetadata(relID, path string, metadata map[string]any, createdAt, updatedAt time.Time) *cliproxyauth.Auth {
+	codexauth.NormalizeAuthMetadata(metadata)
 	provider := strings.TrimSpace(valueAsString(metadata["type"]))
 	if provider == "" {
 		provider = "unknown"
@@ -270,6 +272,7 @@ func normalizePersistedAuth(auth *cliproxyauth.Auth, relID string, metadata map[
 	if auth == nil {
 		return
 	}
+	codexauth.NormalizeAuthMetadata(metadata)
 	auth.ID = normalizeAuthID(relID)
 	if strings.TrimSpace(auth.FileName) == "" {
 		auth.FileName = normalizeAuthID(relID)
@@ -375,6 +378,7 @@ func parseAuthMetadataPayload(payload []byte) (json.RawMessage, map[string]any, 
 	if err := json.Unmarshal(raw, &metadata); err != nil {
 		return nil, nil, fmt.Errorf("postgres store: invalid auth metadata json: %w", err)
 	}
+	codexauth.NormalizeAuthMetadata(metadata)
 	return append(json.RawMessage(nil), raw...), metadata, nil
 }
 

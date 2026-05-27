@@ -1022,6 +1022,23 @@ func (h *Handler) buildAuthFileEntryForList(auth *coreauth.Auth, authoritativeSt
 	}
 	if claims := extractCodexIDTokenClaims(auth); claims != nil {
 		entry["id_token"] = claims
+		if accountID := strings.TrimSpace(valueAsString(claims["chatgpt_account_id"])); accountID != "" {
+			entry["chatgpt_account_id"] = accountID
+			if strings.TrimSpace(valueAsString(entry["account_id"])) == "" {
+				entry["account_id"] = accountID
+			}
+		}
+		if planType := strings.TrimSpace(valueAsString(claims["plan_type"])); planType != "" {
+			entry["plan_type"] = planType
+		}
+	}
+	if auth.Metadata != nil {
+		if accountID := strings.TrimSpace(firstNonEmptyMetadataString(auth.Metadata, "account_id", "chatgpt_account_id")); accountID != "" {
+			entry["account_id"] = accountID
+			if strings.TrimSpace(valueAsString(entry["chatgpt_account_id"])) == "" {
+				entry["chatgpt_account_id"] = accountID
+			}
+		}
 	}
 	// Expose priority from Attributes (set by synthesizer from JSON "priority" field).
 	// Fall back to Metadata for auths registered via UploadAuthFile (no synthesizer).
@@ -1090,8 +1107,13 @@ func extractCodexIDTokenClaims(auth *coreauth.Auth) gin.H {
 	}
 
 	result := gin.H{}
-	if v := strings.TrimSpace(claims.CodexAuthInfo.ChatgptAccountID); v != "" {
+	if v := strings.TrimSpace(claims.GetAccountID()); v != "" {
 		result["chatgpt_account_id"] = v
+	}
+	if v := strings.TrimSpace(claims.CodexAuthInfo.ChatgptUserID); v != "" {
+		result["chatgpt_user_id"] = v
+	} else if v := strings.TrimSpace(claims.CodexAuthInfo.UserID); v != "" {
+		result["chatgpt_user_id"] = v
 	}
 	if v := strings.TrimSpace(claims.CodexAuthInfo.ChatgptPlanType); v != "" {
 		result["plan_type"] = v
@@ -1107,6 +1129,15 @@ func extractCodexIDTokenClaims(auth *coreauth.Auth) gin.H {
 		return nil
 	}
 	return result
+}
+
+func firstNonEmptyMetadataString(metadata map[string]any, keys ...string) string {
+	for _, key := range keys {
+		if value := strings.TrimSpace(valueAsString(metadata[key])); value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 func authEmail(auth *coreauth.Auth) string {
@@ -1560,6 +1591,11 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 			dst = abs
 		}
 	}
+	if normalizedData, ok, errNormalize := normalizeUploadedAuthFileData(data); errNormalize != nil {
+		return errNormalize
+	} else if ok {
+		data = normalizedData
+	}
 	auth, err := h.buildAuthFromFileData(dst, data)
 	if err != nil {
 		return err
@@ -1573,6 +1609,21 @@ func (h *Handler) writeAuthFile(ctx context.Context, name string, data []byte) e
 		return err
 	}
 	return nil
+}
+
+func normalizeUploadedAuthFileData(data []byte) ([]byte, bool, error) {
+	metadata := make(map[string]any)
+	if err := json.Unmarshal(data, &metadata); err != nil {
+		return nil, false, nil
+	}
+	if !codex.NormalizeAuthMetadata(metadata) {
+		return nil, false, nil
+	}
+	normalized, err := json.MarshalIndent(metadata, "", "  ")
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to normalize auth file: %w", err)
+	}
+	return append(normalized, '\n'), true, nil
 }
 
 func requestedAuthFileNamesForDelete(c *gin.Context) ([]string, error) {
@@ -1778,6 +1829,7 @@ func (h *Handler) buildAuthFromFileData(path string, data []byte) (*coreauth.Aut
 	if err := json.Unmarshal(data, &metadata); err != nil {
 		return nil, fmt.Errorf("invalid auth file: %w", err)
 	}
+	codex.NormalizeAuthMetadata(metadata)
 	provider, _ := metadata["type"].(string)
 	if provider == "" {
 		provider = "unknown"
